@@ -55,20 +55,45 @@ document.addEventListener("DOMContentLoaded", async () => {
 });
 
 /**
+ * Esperar a que el Motor WebAssembly HDF5 (h5wasm) se descargue del CDN e inicialice.
+ */
+async function waitForH5Wasm(timeoutMs = 12000) {
+  if (state.h5wasmReady && typeof h5wasm !== "undefined" && h5wasm.FS) return true;
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (typeof h5wasm !== "undefined" && h5wasm.ready) {
+      try {
+        await h5wasm.ready;
+        state.h5wasmReady = true;
+        console.log("Motor WebAssembly HDF5 (h5wasm) listo. FS disponible:", !!h5wasm.FS);
+        return true;
+      } catch (e) {
+        console.warn("Error al inicializar h5wasm:", e);
+        return false;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  console.warn("Timeout esperando disponibilidad de h5wasm");
+  return false;
+}
+
+/**
  * Inicializar Motor WebAssembly HDF5 (h5wasm)
  */
 async function initH5Wasm() {
-  if (typeof h5wasm !== "undefined" && h5wasm.ready) {
-    try {
-      await h5wasm.ready;
-      // h5wasm.FS ya está disponible como getter directo después de ready
-      state.h5wasmReady = true;
-      console.log("Motor WebAssembly HDF5 (h5wasm) inicializado. FS:", !!h5wasm.FS);
-    } catch (e) {
-      console.warn("Error al inicializar h5wasm:", e);
+  statusText.textContent = "Cargando motor WASM...";
+  const ready = await waitForH5Wasm(12000);
+  if (ready) {
+    statusText.textContent = "Motor WebAssembly Listo";
+    // Si un dataset se cargó en modo indexado antes de que el motor estuviese listo, re-cargarlo ahora
+    if (state.ncData && state.ncData.isIndexedFallback && state.activeFilename) {
+      console.log("Motor WASM listo. Re-cargando dataset activo:", state.activeFilename);
+      fetchAndLoadNetCDF(state.activeFilename);
     }
   } else {
-    console.warn("h5wasm no disponible en window.");
+    statusText.textContent = "Catálogo Listo (Modo Respaldo)";
   }
 }
 
@@ -218,17 +243,15 @@ function autoDetectAndLoadRegion() {
  * Carga de NetCDF a través de HTTP y Parser Universal
  */
 async function fetchAndLoadNetCDF(filename) {
-  if (state.activeFilename === filename && state.ncData) {
+  if (state.activeFilename === filename && state.ncData && !state.ncData.isIndexedFallback) {
     queryAndPlot();
     return;
   }
 
   statusText.textContent = `Cargando ${filename}...`;
 
-  // Asegurar que h5wasm esté listo antes de intentar parsear
-  if (typeof h5wasm !== "undefined" && !state.h5wasmReady) {
-    try { await h5wasm.ready; state.h5wasmReady = true; } catch (_) {}
-  }
+  // Esperar a que el motor WASM se inicialice si la red está lenta (ej: GitHub Pages)
+  await waitForH5Wasm(12000);
 
   try {
     let buffer;
@@ -685,7 +708,7 @@ function renderPlot() {
       text: `Perfil Extraído: ${state.activeFilename} (Este: ${ext.targetX.toLocaleString()}, Norte: ${ext.targetY.toLocaleString()})`,
       font: { color: "#f8fafc", size: 13 }
     },
-    xaxis: { title: "Tiempo / Fecha", gridcolor: "rgba(255,255,255,0.05)" },
+    xaxis: { title: "Tiempo / Fecha", type: "category", gridcolor: "rgba(255,255,255,0.05)" },
     yaxis: { title: "Valor de Variable", gridcolor: "rgba(255,255,255,0.05)", rangemode: "tozero" },
     margin: { l: 60, r: 30, t: 50, b: 50 },
     legend: { orientation: "h", y: 1.15 },
