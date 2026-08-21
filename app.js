@@ -461,24 +461,23 @@ function queryAndPlot() {
     const values = [];
 
     for (let t = 0; t < timeSteps.length; t++) {
-      let val;
+      let val = null;
       if (data) {
         if (vObj.dimensions && vObj.dimensions.length === 3) {
           const idx = t * (numY * numX) + nearestJ * numX + nearestI;
-          val = data[idx];
+          const raw = data[idx];
+          // Keep 0 as a valid value; only discard NaN or fill values (>1e30)
+          if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
         } else if (vObj.dimensions && vObj.dimensions.length === 2) {
           const idx = nearestJ * numX + nearestI;
-          val = data[idx];
-        } else if (data[t] !== undefined) {
+          const raw = data[idx];
+          if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
+        } else if (data[t] !== undefined && !isNaN(data[t]) && data[t] <= 1e30) {
           val = data[t];
         }
       }
 
-      if (val === undefined || isNaN(val) || val > 1e30) {
-        val = 15.0 + Math.sin((t / 12) * Math.PI * 2) * 8.5 + (Math.random() * 0.5);
-      }
-
-      values.push(parseFloat(val.toFixed(4)));
+      values.push(val !== null ? parseFloat(val.toFixed(6)) : null);
     }
 
     extracted[varName] = { values: values, units: vObj.units || vObj.attributes?.units || "" };
@@ -519,17 +518,36 @@ function renderPlot() {
     if (selectedVar !== "all" && selectedVar !== varName) return;
 
     const vData = ext.extracted[varName];
+    // Check if all values are null (no readable data at this point)
+    const hasData = vData.values.some(v => v !== null);
+    const allZero = hasData && vData.values.every(v => v === null || v === 0);
+
     traces.push({
       x: timeX,
       y: vData.values,
       type: "scatter",
       mode: "lines+markers",
-      name: `${varName} ${vData.units ? "(" + vData.units + ")" : ""}`,
-      line: { color: colors[colorIdx % colors.length], width: 3 },
-      marker: { size: 6, color: colors[colorIdx % colors.length] }
+      name: `${varName} ${vData.units ? "(" + vData.units + ")" : ""}` + (allZero ? " [sin datos en este punto]" : ""),
+      connectgaps: false,
+      line: { color: colors[colorIdx % colors.length], width: 2 },
+      marker: { size: 5, color: colors[colorIdx % colors.length] }
     });
     colorIdx++;
   });
+
+  // Detect if every extracted trace is entirely null/zero at this location
+  const allTracesEmpty = Object.keys(ext.extracted).every(varName => {
+    if (selectedVar !== "all" && selectedVar !== varName) return true;
+    return ext.extracted[varName].values.every(v => v === null || v === 0);
+  });
+
+  const annotations = allTracesEmpty ? [{
+    x: 0.5, y: 0.5,
+    xref: "paper", yref: "paper",
+    text: "Sin niebla registrada en este punto de la malla",
+    font: { color: "#94a3b8", size: 14 },
+    showarrow: false
+  }] : [];
 
   const layout = {
     paper_bgcolor: "rgba(0,0,0,0)",
@@ -540,9 +558,10 @@ function renderPlot() {
       font: { color: "#f8fafc", size: 13 }
     },
     xaxis: { title: "Tiempo / Fecha", gridcolor: "rgba(255,255,255,0.05)" },
-    yaxis: { title: "Valor de Variable", gridcolor: "rgba(255,255,255,0.05)" },
+    yaxis: { title: "Valor de Variable", gridcolor: "rgba(255,255,255,0.05)", rangemode: "tozero" },
     margin: { l: 60, r: 30, t: 50, b: 50 },
-    legend: { orientation: "h", y: 1.15 }
+    legend: { orientation: "h", y: 1.15 },
+    annotations
   };
 
   Plotly.newPlot("plot-container", traces, layout, { responsive: true, displaylogo: false });
