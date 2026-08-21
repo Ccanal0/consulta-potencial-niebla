@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Explorador Espacial NetCDF AMARU | Datasets Regionales de Chile</title>
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  
+  <!-- Custom Style -->
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">
+        <i class="fa-solid fa-water"></i>
+      </div>
+      <div class="brand-text">
+        <h1>Explorador Espacial NetCDF AMARU</h1>
+        <p>Consulta Interactiva y Exportación a Excel (Motor NetCDF4 / HDF5)</p>
+      </div>
+    </div>
+    <div class="status-badge" id="status-indicator">
+      <span class="status-dot"></span>
+      <span id="status-text">Inicializando Sistema...</span>
+    </div>
+  </header>
+
+  <!-- App Main Layout -->
+  <div class="app-container">
+    
+    <!-- Sidebar Controls -->
+    <aside class="sidebar">
+      
+      <!-- Dataset Selector Panel -->
+      <div class="panel-card">
+        <div class="card-title">
+          <i class="fa-solid fa-database"></i> 1. Seleccionar Archivo NetCDF Regional
+        </div>
+        
+        <div class="input-group">
+          <label for="dataset-select">
+            Dataset NetCDF Disponible
+            <span class="unit" id="dataset-count">11 Regiones</span>
+          </label>
+          <select id="dataset-select">
+            <option value="AUTO">⚡ Detección Automática de Región según Coordenadas</option>
+          </select>
+        </div>
+
+        <div id="loaded-file-info" class="loaded-file-info" style="margin-top:0.75rem;">
+          <i class="fa-solid fa-circle-check"></i> <span id="file-name-display">Archivo Activo</span>
+        </div>
+      </div>
+
+      <!-- Coordinate Input Panel -->
+      <div class="panel-card">
+        <div class="card-title">
+          <i class="fa-solid fa-location-crosshairs"></i> 2. Extracción por Coordenadas
+        </div>
+
+        <div class="input-group">
+          <label for="crs-select">
+            Sistema de Coordenadas (SRC)
+            <span class="unit">Código EPSG</span>
+          </label>
+          <select id="crs-select">
+            <option value="EPSG:32719">UTM Zona 19S (Chile Central/Este) - EPSG:32719</option>
+            <option value="EPSG:32718">UTM Zona 18S (Chile Costero/Oeste) - EPSG:32718</option>
+            <option value="EPSG:4326">WGS 84 Geográficas - EPSG:4326 (Lat / Lon)</option>
+          </select>
+        </div>
+
+        <div class="grid-2col">
+          <div class="input-group">
+            <label for="easting-input">
+              Este (X)
+              <span class="unit" id="x-unit">metros</span>
+            </label>
+            <input type="number" id="easting-input" step="1" placeholder="Ej: 350000" value="350000" />
+          </div>
+
+          <div class="input-group">
+            <label for="northing-input">
+              Norte (Y)
+              <span class="unit" id="y-unit">metros</span>
+            </label>
+            <input type="number" id="northing-input" step="1" placeholder="Ej: 630000" value="6300000" />
+          </div>
+        </div>
+
+        <button id="btn-extract" class="btn btn-primary" style="margin-top: 1rem;">
+          <i class="fa-solid fa-bolt"></i> Consultar y Graficar Coordenadas
+        </button>
+      </div>
+
+      <!-- Excel Export Panel -->
+      <div class="panel-card">
+        <div class="card-title">
+          <i class="fa-solid fa-file-excel"></i> 3. Descargar Resultados
+        </div>
+        
+        <p style="font-size:0.8rem; color:var(--text-secondary); margin-bottom: 0.75rem;">
+          Exporta las series de tiempo y metadatos de extracción directamente a Excel (.xlsx).
+        </p>
+
+        <button id="btn-export-excel" class="btn btn-success">
+          <i class="fa-solid fa-download"></i> Descargar Excel (.xlsx)
+        </button>
+      </div>
+
+      <!-- Nearest Point Metadata -->
+      <div class="panel-card">
+        <div class="card-title">
+          <i class="fa-solid fa-circle-info"></i> Detalles de Extracción
+        </div>
+        <table class="info-table">
+          <tr>
+            <td>Archivo Regional Activo:</td>
+            <td id="meta-file-name" style="font-size:0.75rem; word-break:break-all;">-</td>
+          </tr>
+          <tr>
+            <td>Lat / Lon Calculada:</td>
+            <td id="meta-latlon">-</td>
+          </tr>
+          <tr>
+            <td>Celda de Malla más Cercana:</td>
+            <td id="meta-grid">-</td>
+          </tr>
+          <tr>
+            <td>Coord. Malla más Cercana:</td>
+            <td id="meta-nearest-coords">-</td>
+          </tr>
+          <tr>
+            <td>Pasos de Tiempo:</td>
+            <td id="meta-time-count">-</td>
+          </tr>
+        </table>
+      </div>
+
+    </aside>
+
+    <!-- Main Workspace (Map + Chart) -->
+    <main class="main-content">
+      
+      <!-- Interactive Leaflet Map -->
+      <div class="map-card">
+        <div id="map"></div>
+        <div class="map-badge">
+          <i class="fa-solid fa-mouse-pointer"></i> Haz clic en cualquier punto de Chile para consultar la malla NetCDF
+        </div>
+      </div>
+
+      <!-- Interactive Plotly Chart -->
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title-group">
+            <h2 id="chart-title">Serie de Tiempo NetCDF Regional AMARU</h2>
+            <p id="chart-subtitle">Perfil extraído en coordenadas</p>
+          </div>
+          <div class="chart-controls">
+            <label for="var-select" style="margin:0; align-items:center; gap:0.5rem;">
+              Variable:
+              <select id="var-select" style="width: auto; padding: 0.4rem 0.6rem;">
+                <option value="all">Todas las Variables</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div id="plot-container"></div>
+      </div>
+
+    </main>
+
+  </div>
+
+  <!-- Static Distribution Libraries -->
+  <!-- Proj4JS for UTM <-> Lat/Lon conversion -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.2/proj4.js"></script>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Plotly JS -->
+  <script src="https://cdn.plot.ly/plotly-2.29.1.min.js"></script>
+
+  <!-- SheetJS (XLSX Exporter) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <!-- H5WASM WebAssembly HDF5 / NetCDF4 Engine -->
+  <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.6/dist/h5wasm.js"></script>
+
+  <!-- NetCDF3 JS Fallback Parser -->
+  <script src="https://cdn.jsdelivr.net/npm/netcdfjs@0.7.0/dist/netcdfjs.min.js"></script>
+
+  <!-- Main Application Script -->
+  <script src="app.js"></script>
+
+</body>
+</html>
