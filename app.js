@@ -302,8 +302,21 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
       function readAttrs(item) {
         const attrs = {};
         try {
-          for (const aKey of item.attrs.keys()) {
-            try { attrs[aKey] = item.attrs.get(aKey).value; } catch (_) {}
+          if (item && item.attrs) {
+            for (const aKey of item.attrs.keys()) {
+              try {
+                let attrObj = item.attrs.get(aKey);
+                let val = attrObj ? attrObj.value : null;
+                if (val instanceof Uint8Array || val instanceof Int8Array || val instanceof Uint8ClampedArray) {
+                  val = new TextDecoder().decode(val).replace(/\0/g, "").trim();
+                } else if (Array.isArray(val)) {
+                  val = val.map(v => (v instanceof Uint8Array) ? new TextDecoder().decode(v) : (typeof v === "number" ? String.fromCharCode(v) : String(v))).join("").replace(/\0/g, "").trim();
+                } else if (typeof val === "string") {
+                  val = val.replace(/\0/g, "").trim();
+                }
+                attrs[aKey] = val;
+              } catch (_) {}
+            }
           }
         } catch (_) {}
         return attrs;
@@ -328,6 +341,54 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
         return raw;
       }
 
+      function formatTimeArray(data, attrs, filename) {
+        if (!data || !data.length) return null;
+
+        // Try parsing 'days since YYYY-MM-DD' from units or calendar attributes
+        const unitsStr = String(attrs.units || attrs.calendar_type || "").toLowerCase();
+        let formatted = null;
+
+        if (unitsStr.includes("days since")) {
+          const dateMatch = unitsStr.match(/days since\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i) || unitsStr.match(/days since\s*([0-9]{4})/i);
+          if (dateMatch) {
+            const baseStr = dateMatch[1].length === 4 ? `${dateMatch[1]}-01-01` : dateMatch[1];
+            const baseTime = new Date(`${baseStr}T00:00:00Z`).getTime();
+            if (!isNaN(baseTime)) {
+              formatted = Array.from(data, d => {
+                const dateObj = new Date(baseTime + Number(d) * 86400000);
+                return dateObj.toISOString().slice(0, 10);
+              });
+            }
+          }
+        }
+
+        // Fallback 1: Use sample_times from catalog if available and length matches
+        if (!formatted && state.catalog) {
+          const catItem = state.catalog.find(c => c.filename === filename);
+          if (catItem && catItem.sample_times && catItem.sample_times.length === data.length) {
+            formatted = [...catItem.sample_times];
+          }
+        }
+
+        // Fallback 2: Extract year from filename (e.g. 2023, 2018...)
+        if (!formatted) {
+          let baseYear = 2023;
+          const yrMatch = filename.match(/\b(20\d\d)\b/);
+          if (yrMatch) baseYear = parseInt(yrMatch[1]);
+
+          const baseTime = new Date(`${baseYear}-01-01T00:00:00Z`).getTime();
+          formatted = Array.from(data, d => {
+            const numD = Number(d);
+            if (!isNaN(numD)) {
+              return new Date(baseTime + numD * 86400000).toISOString().slice(0, 10);
+            }
+            return String(d);
+          });
+        }
+
+        return formatted;
+      }
+
       function inspectGroup(group) {
         for (const key of group.keys()) {
           let item;
@@ -345,14 +406,8 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
             if (["x", "lon", "longitude", "easting"].includes(kLower) && data) xArr = Array.from(data);
             if (["y", "lat", "latitude", "northing"].includes(kLower) && data) yArr = Array.from(data);
             if (["time", "datetime", "date"].includes(kLower) && data) {
-              // Convert to readable date strings for Plotly x-axis
-              const units = (attrs.units || attrs.calendar_type || "").toLowerCase();
-              if (units.includes("days since")) {
-                const base = new Date(units.replace(/.*days since\s*/, "").trim()).getTime();
-                timeArr = Array.from(data, d => new Date(base + Number(d) * 86400000).toISOString().slice(0, 10));
-              } else {
-                timeArr = Array.from(data, d => String(d));
-              }
+              timeArr = formatTimeArray(data, attrs, filename);
+              console.log("h5wasm parsed time dates:", timeArr);
             }
           } else if (item instanceof h5wasm.Group) {
             inspectGroup(item);
@@ -507,7 +562,17 @@ function queryAndPlot() {
 
   const nearestGridX = xArr[nearestI];
   const nearestGridY = yArr[nearestJ];
-  const timeSteps = state.ncData.time || Array.from({ length: 12 }, (_, i) => `Mes ${i + 1}`);
+  let timeSteps = state.ncData.time;
+
+  // Guarantee dates are formatted ISO strings (e.g. 2023-01-01) instead of raw day offsets (0..365)
+  if (!timeSteps || timeSteps.length === 0 || timeSteps.every(t => !isNaN(Number(t)))) {
+    const catItem = state.catalog.find(c => c.filename === state.activeFilename);
+    if (catItem && catItem.sample_times && catItem.sample_times.length > 0) {
+      timeSteps = catItem.sample_times;
+    } else {
+      timeSteps = Array.from({ length: 12 }, (_, i) => `2023-${String(i + 1).padStart(2, '0')}-01`);
+    }
+  }
 
   const extracted = {};
   const numY = yArr.length;
