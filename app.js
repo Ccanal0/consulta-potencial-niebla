@@ -309,27 +309,51 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
         return attrs;
       }
 
+      // CRITICAL: item.value is backed by WASM heap memory.
+      // After file.close() that memory is freed — all values read as 0.
+      // copyToJS() creates an independent JS-heap copy BEFORE file.close().
+      function copyToJS(raw) {
+        if (!raw) return null;
+        if (raw instanceof BigInt64Array || raw instanceof BigUint64Array)
+          return Array.from(raw, v => Number(v));
+        if (raw instanceof Float32Array) return new Float32Array(raw);
+        if (raw instanceof Float64Array) return new Float64Array(raw);
+        if (raw instanceof Int32Array)   return new Int32Array(raw);
+        if (raw instanceof Int16Array)   return new Int16Array(raw);
+        if (ArrayBuffer.isView(raw))     return new Float32Array(raw);
+        if (Array.isArray(raw)) {
+          try { return new Float32Array(raw.flat ? raw.flat(Infinity) : [].concat(...raw)); }
+          catch (_) { return raw; }
+        }
+        return raw;
+      }
+
       function inspectGroup(group) {
         for (const key of group.keys()) {
           let item;
           try { item = group.get(key); } catch (_) { continue; }
           if (item instanceof h5wasm.Dataset) {
-            let data;
-            try { data = item.value; } catch (_) { data = null; }
+            let rawData;
+            try { rawData = item.value; } catch (_) { rawData = null; }
+            const data = copyToJS(rawData);   // copy before file.close()!
             const attrs = readAttrs(item);
-            vars[key] = {
-              name: key,
-              dimensions: item.shape,
-              data: data,
-              units: attrs.units || "",
-              attributes: attrs
-            };
-            console.log("h5wasm var: " + key + ", shape: " + JSON.stringify(item.shape) + ", units: " + (attrs.units || ""));
+            const shapeStr = (item.shape || []).join("x");
+            vars[key] = { name: key, dimensions: item.shape, data: data, units: attrs.units || "", attributes: attrs };
+            console.log("h5wasm " + key + " [" + shapeStr + "] len=" + (data ? data.length : "null") + " units=" + (attrs.units || ""));
 
             const kLower = key.toLowerCase();
             if (["x", "lon", "longitude", "easting"].includes(kLower) && data) xArr = Array.from(data);
             if (["y", "lat", "latitude", "northing"].includes(kLower) && data) yArr = Array.from(data);
-            if (["time", "datetime", "date"].includes(kLower) && data) timeArr = Array.from(data);
+            if (["time", "datetime", "date"].includes(kLower) && data) {
+              // Convert to readable date strings for Plotly x-axis
+              const units = (attrs.units || attrs.calendar_type || "").toLowerCase();
+              if (units.includes("days since")) {
+                const base = new Date(units.replace(/.*days since\s*/, "").trim()).getTime();
+                timeArr = Array.from(data, d => new Date(base + Number(d) * 86400000).toISOString().slice(0, 10));
+              } else {
+                timeArr = Array.from(data, d => String(d));
+              }
+            }
           } else if (item instanceof h5wasm.Group) {
             inspectGroup(item);
           }
@@ -470,7 +494,8 @@ function queryAndPlot() {
   const queryX = isNcLatLon ? state.lon : targetX;
   const queryY = isNcLatLon ? state.lat : targetY;
 
-  console.log("queryAndPlot: isNcLatLon="+isNcLatLon+" queryX="+queryX.toFixed(4)+" queryY="+queryY.toFixed(4));
+  // Lightweight debug: shows clicked coords and found grid indices
+  console.log("query: lat="+queryY.toFixed(4)+" lon="+queryX.toFixed(4)+" → nearestJ=" + 0 + " nearestI=" + 0 + " (computing...)");
 
   for (let i = 0; i < xArr.length; i++) {
     if (Math.abs(xArr[i] - queryX) < Math.abs(xArr[nearestI] - queryX)) nearestI = i;
@@ -501,6 +526,9 @@ function queryAndPlot() {
         if (vObj.dimensions && vObj.dimensions.length === 3) {
           const idx = t * (numY * numX) + nearestJ * numX + nearestI;
           const raw = data[idx];
+          if (t === 0 && varName === Object.keys(state.ncData.variables).find(k => !["x","y","lat","lon","time","datetime"].includes(k.toLowerCase()))) {
+            console.log("data check " + varName + ": nearestJ=" + nearestJ + " nearestI=" + nearestI + " idx=" + idx + " val=" + raw + " dataLen=" + data.length);
+          }
           // Keep 0 as a valid value; only discard NaN or fill values (>1e30)
           if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
         } else if (vObj.dimensions && vObj.dimensions.length === 2) {
