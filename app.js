@@ -44,11 +44,13 @@ const metaTimeCount = document.getElementById("meta-time-count");
 
 // Mapa Leaflet y Capas
 let map, marker, regionPolygonsGroup;
+let ncOverlayLayer = null;
+let ncLegendControl = null;
 
 document.addEventListener("DOMContentLoaded", async () => {
   initMap();
   setupEventListeners();
-  initH5Wasm();
+  await initH5Wasm();          // esperar antes de cargar archivos
   await loadCatalogAndIndex();
 });
 
@@ -59,11 +61,14 @@ async function initH5Wasm() {
   if (typeof h5wasm !== "undefined" && h5wasm.ready) {
     try {
       await h5wasm.ready;
+      // h5wasm.FS ya está disponible como getter directo después de ready
       state.h5wasmReady = true;
-      console.log("Motor WebAssembly HDF5 (h5wasm) inicializado.");
+      console.log("Motor WebAssembly HDF5 (h5wasm) inicializado. FS:", !!h5wasm.FS);
     } catch (e) {
       console.warn("Error al inicializar h5wasm:", e);
     }
+  } else {
+    console.warn("h5wasm no disponible en window.");
   }
 }
 
@@ -135,7 +140,7 @@ function setupEventListeners() {
     exportToExcel();
   });
 
-  varSelect.addEventListener("change", () => { renderPlot(); });
+  varSelect.addEventListener("change", () => { renderPlot(); drawNetCDFOverlay(); });
 }
 
 async function loadCatalogAndIndex() {
@@ -220,6 +225,11 @@ async function fetchAndLoadNetCDF(filename) {
 
   statusText.textContent = `Cargando ${filename}...`;
 
+  // Asegurar que h5wasm esté listo antes de intentar parsear
+  if (typeof h5wasm !== "undefined" && !state.h5wasmReady) {
+    try { await h5wasm.ready; state.h5wasmReady = true; } catch (_) {}
+  }
+
   try {
     let buffer;
     if (state.ncCache.has(filename)) {
@@ -241,6 +251,7 @@ async function fetchAndLoadNetCDF(filename) {
 
     populateVariableSelect();
     queryAndPlot();
+    drawNetCDFOverlay();
   } catch (err) {
     console.error("Fallo al procesar NetCDF:", err);
     
@@ -264,6 +275,7 @@ async function fetchAndLoadNetCDF(filename) {
 
       populateVariableSelect();
       queryAndPlot();
+      drawNetCDFOverlay();
     } else {
       statusText.textContent = `Error al cargar ${filename}`;
       alert(`No se pudo cargar ${filename}. Asegúrate de que el navegador soporte ArrayBuffer.`);
@@ -276,33 +288,48 @@ async function fetchAndLoadNetCDF(filename) {
  */
 async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
   // Método 1: h5wasm para NetCDF4 / HDF5
-  if (typeof h5wasm !== "undefined") {
+  if (typeof h5wasm !== "undefined" && h5wasm.FS) {
     try {
-      if (!state.h5wasmReady && h5wasm.ready) await h5wasm.ready;
-
+      // En el build IIFE, h5wasm.FS es un getter directo disponible tras await h5wasm.ready
+      const FS = h5wasm.FS;
       const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-      h5wasm.fs.writeFile(safeName, new Uint8Array(arrayBuffer));
+      FS.writeFile(safeName, new Uint8Array(arrayBuffer));
 
       const file = new h5wasm.File(safeName, "r");
       const vars = {};
       let xArr = null, yArr = null, timeArr = null;
 
+      function readAttrs(item) {
+        const attrs = {};
+        try {
+          for (const aKey of item.attrs.keys()) {
+            try { attrs[aKey] = item.attrs.get(aKey).value; } catch (_) {}
+          }
+        } catch (_) {}
+        return attrs;
+      }
+
       function inspectGroup(group) {
         for (const key of group.keys()) {
-          const item = group.get(key);
+          let item;
+          try { item = group.get(key); } catch (_) { continue; }
           if (item instanceof h5wasm.Dataset) {
-            const data = item.value;
+            let data;
+            try { data = item.value; } catch (_) { data = null; }
+            const attrs = readAttrs(item);
             vars[key] = {
               name: key,
               dimensions: item.shape,
               data: data,
-              attributes: {}
+              units: attrs.units || "",
+              attributes: attrs
             };
+            console.log("h5wasm var: " + key + ", shape: " + JSON.stringify(item.shape) + ", units: " + (attrs.units || ""));
 
             const kLower = key.toLowerCase();
-            if (["x", "lon", "longitude", "easting"].includes(kLower)) xArr = Array.from(data);
-            if (["y", "lat", "latitude", "northing"].includes(kLower)) yArr = Array.from(data);
-            if (["time", "datetime", "date"].includes(kLower)) timeArr = Array.from(data);
+            if (["x", "lon", "longitude", "easting"].includes(kLower) && data) xArr = Array.from(data);
+            if (["y", "lat", "latitude", "northing"].includes(kLower) && data) yArr = Array.from(data);
+            if (["time", "datetime", "date"].includes(kLower) && data) timeArr = Array.from(data);
           } else if (item instanceof h5wasm.Group) {
             inspectGroup(item);
           }
@@ -312,11 +339,14 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
       inspectGroup(file);
       file.close();
 
+      console.log("h5wasm parsed " + filename + ": x=" + (xArr ? xArr.length : "null") + ", y=" + (yArr ? yArr.length : "null") + ", vars=" + Object.keys(vars).join(","));
+
       if (xArr && yArr) {
         return { dimensions: {}, variables: vars, x: xArr, y: yArr, time: timeArr };
       }
+      throw new Error("No se encontraron coords x/y en " + filename + ". Variables halladas: " + Object.keys(vars).join(", "));
     } catch (e) {
-      console.warn("Fallback de h5wasm a netcdfjs:", e);
+      console.warn("h5wasm error, intentando netcdfjs:", e.message || e);
     }
   }
 
@@ -433,9 +463,14 @@ function queryAndPlot() {
 
   let nearestI = 0, nearestJ = 0;
 
-  const isNcLatLon = Math.max(...xArr) <= 180 && Math.min(...xArr) >= -180;
+  // Usar loop en vez de spread para evitar stack overflow en arrays grandes
+  let xMin = xArr[0], xMax = xArr[0];
+  for (let k = 1; k < xArr.length; k++) { if (xArr[k] < xMin) xMin = xArr[k]; if (xArr[k] > xMax) xMax = xArr[k]; }
+  const isNcLatLon = xMax <= 180 && xMin >= -180;
   const queryX = isNcLatLon ? state.lon : targetX;
   const queryY = isNcLatLon ? state.lat : targetY;
+
+  console.log("queryAndPlot: isNcLatLon="+isNcLatLon+" queryX="+queryX.toFixed(4)+" queryY="+queryY.toFixed(4));
 
   for (let i = 0; i < xArr.length; i++) {
     if (Math.abs(xArr[i] - queryX) < Math.abs(xArr[nearestI] - queryX)) nearestI = i;
@@ -565,6 +600,197 @@ function renderPlot() {
   };
 
   Plotly.newPlot("plot-container", traces, layout, { responsive: true, displaylogo: false });
+}
+
+/**
+ * Renderiza capa ráster del NetCDF activo sobre el mapa Leaflet.
+ * Calcula la suma espacial sobre todos los pasos de tiempo y la dibuja
+ * en un canvas HTML, luego lo superpone como ImageOverlay.
+ */
+function drawNetCDFOverlay() {
+  if (!state.ncData) return;
+
+  // Limpiar capas previas
+  if (ncOverlayLayer) { map.removeLayer(ncOverlayLayer); ncOverlayLayer = null; }
+  if (ncLegendControl) { map.removeControl(ncLegendControl); ncLegendControl = null; }
+
+  const xArr = state.ncData.x;
+  const yArr = state.ncData.y;
+  if (!xArr || !yArr || xArr.length === 0 || yArr.length === 0) return;
+
+  // Si es fallback indexado (sin datos reales), solo centrar el mapa
+  if (state.ncData.isIndexedFallback) {
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    for (const v of yArr) { if (v < minLat) minLat = v; if (v > maxLat) maxLat = v; }
+    for (const v of xArr) { if (v < minLon) minLon = v; if (v > maxLon) maxLon = v; }
+    map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
+    return;
+  }
+
+  const numX = xArr.length;
+  const numY = yArr.length;
+
+  // Determinar variable a renderizar
+  const selectedVar = varSelect.value;
+  const varNames = Object.keys(state.ncData.variables).filter(
+    v => !["x", "y", "lat", "lon", "time", "datetime"].includes(v.toLowerCase())
+  );
+  if (!varNames.length) return;
+
+  const varToPlot = (selectedVar !== "all" && varNames.includes(selectedVar))
+    ? selectedVar : varNames[0];
+
+  const vObj = state.ncData.variables[varToPlot];
+  const data = vObj ? vObj.data : null;
+  if (!data) return;
+
+  statusText.textContent = "Generando mapa ráster...";
+
+  // Calcular suma temporal → mapa 2D [j * numX + i]
+  const grid2d = new Float32Array(numY * numX);
+
+  if (vObj.dimensions && vObj.dimensions.length === 3) {
+    // Inferir número real de pasos de tiempo a partir del tamaño del array
+    const actualT = Math.round(data.length / (numY * numX));
+    for (let t = 0; t < actualT; t++) {
+      const base = t * numY * numX;
+      for (let j = 0; j < numY; j++) {
+        const rowBase = base + j * numX;
+        for (let i = 0; i < numX; i++) {
+          const raw = data[rowBase + i];
+          if (raw > 0 && raw <= 1e30 && !isNaN(raw)) {
+            grid2d[j * numX + i] += raw;
+          }
+        }
+      }
+    }
+  } else if (vObj.dimensions && vObj.dimensions.length === 2) {
+    for (let k = 0; k < grid2d.length && k < data.length; k++) {
+      const raw = data[k];
+      if (raw > 0 && raw <= 1e30 && !isNaN(raw)) grid2d[k] = raw;
+    }
+  }
+
+  // Calcular valor máximo para normalización
+  let maxVal = 0;
+  for (let k = 0; k < grid2d.length; k++) {
+    if (grid2d[k] > maxVal) maxVal = grid2d[k];
+  }
+
+  if (maxVal === 0) {
+    statusText.textContent = `Cargado ${state.activeFilename} (sin datos no-cero en el área)`;
+    return;
+  }
+
+  // Mapa de colores azules para datos de niebla/agua líquida
+  function fogColormap(norm) {
+    if (norm <= 0) return [0, 0, 0, 0]; // transparente
+    const stops = [
+      [0.001, [8,   48,  107, 30]],
+      [0.15,  [8,   81,  156, 120]],
+      [0.35,  [33,  113, 181, 175]],
+      [0.60,  [66,  146, 198, 210]],
+      [0.80,  [107, 174, 214, 235]],
+      [1.00,  [198, 219, 239, 255]]
+    ];
+    for (let s = 1; s < stops.length; s++) {
+      if (norm <= stops[s][0]) {
+        const t = (norm - stops[s - 1][0]) / (stops[s][0] - stops[s - 1][0]);
+        return stops[s - 1][1].map((v, i) => Math.round(v + t * (stops[s][1][i] - v)));
+      }
+    }
+    return stops[stops.length - 1][1];
+  }
+
+  // Dibujar canvas
+  const canvas = document.createElement("canvas");
+  canvas.width = numX;
+  canvas.height = numY;
+  const ctx = canvas.getContext("2d");
+  const imgData = ctx.createImageData(numX, numY);
+
+  // Detectar orientación de latitud (si asciende o desciende con el índice)
+  const latAscending = yArr.length > 1 && yArr[1] > yArr[0];
+
+  for (let j = 0; j < numY; j++) {
+    // El canvas row 0 debe ser el Norte (latitud máxima).
+    // Si lat desciende (más común en NetCDF geoespacial): row 0 = North → dataJ = j
+    // Si lat asciende: row 0 = South → hay que invertir
+    const dataJ = latAscending ? (numY - 1 - j) : j;
+    const rowBase = dataJ * numX;
+    const canvasBase = j * numX;
+    for (let i = 0; i < numX; i++) {
+      const norm = grid2d[rowBase + i] / maxVal;
+      const [r, g, b, a] = fogColormap(norm);
+      const px = (canvasBase + i) * 4;
+      imgData.data[px]     = r;
+      imgData.data[px + 1] = g;
+      imgData.data[px + 2] = b;
+      imgData.data[px + 3] = a;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+
+  // Calcular bounding box geográfico
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  for (const v of yArr) { if (v < minLat) minLat = v; if (v > maxLat) maxLat = v; }
+  for (const v of xArr) { if (v < minLon) minLon = v; if (v > maxLon) maxLon = v; }
+
+  // Agregar overlay al mapa
+  const imageUrl = canvas.toDataURL("image/png");
+  ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
+    opacity: 0.82,
+    interactive: false,
+    zIndex: 200
+  }).addTo(map);
+
+  // Ajustar vista del mapa a los límites del dataset
+  map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
+
+  // Agregar leyenda de color
+  const units = (vObj.units || vObj.attributes?.units || "").trim();
+  ncLegendControl = L.control({ position: "bottomright" });
+  ncLegendControl.onAdd = function () {
+    const div = L.DomUtil.create("div", "nc-raster-legend");
+    div.innerHTML = `
+      <div style="
+        background: rgba(15,23,42,0.88);
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid rgba(56,189,248,0.35);
+        font-family: Inter, sans-serif;
+        color: #94a3b8;
+        font-size: 12px;
+        min-width: 150px;
+        backdrop-filter: blur(6px);
+      ">
+        <div style="font-weight:600;color:#f8fafc;margin-bottom:6px;">
+          ${varToPlot}${units ? " ("+units+")" : ""}
+        </div>
+        <div style="
+          width:100%;
+          height:12px;
+          border-radius:4px;
+          background: linear-gradient(to right,
+            rgba(8,48,107,0.4),
+            rgb(33,110,180),
+            rgb(107,174,214),
+            rgb(198,219,239)
+          );
+          margin-bottom:4px;
+        "></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;">
+          <span>0</span>
+          <span>${maxVal.toFixed(2)}</span>
+        </div>
+        <div style="margin-top:5px;font-size:10px;color:#64748b;">Σ anual (todos los meses)</div>
+      </div>
+    `;
+    return div;
+  };
+  ncLegendControl.addTo(map);
+
+  statusText.textContent = `Mapa ráster: ${varToPlot} — ${state.activeFilename}`;
 }
 
 function exportToExcel() {
