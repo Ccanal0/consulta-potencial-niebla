@@ -583,8 +583,9 @@ function queryAndPlot() {
     if (Math.abs(yArr[j] - queryY) < Math.abs(yArr[nearestJ] - queryY)) nearestJ = j;
   }
 
-  const nearestGridX = xArr[nearestI];
-  const nearestGridY = yArr[nearestJ];
+  const numY = yArr.length;
+  const numX = xArr.length;
+
   let timeSteps = state.ncData.time;
 
   // Guarantee dates are formatted ISO strings (e.g. 2023-01-01) instead of raw day offsets (0..365)
@@ -597,13 +598,80 @@ function queryAndPlot() {
     }
   }
 
+  const varKeys = Object.keys(state.ncData.variables).filter(
+    k => !["x", "y", "lat", "lon", "time", "datetime"].includes(k.toLowerCase())
+  );
+
+  // Check if exact cell has non-zero data
+  let exactHasData = false;
+  for (const vName of varKeys) {
+    const data = state.ncData.variables[vName]?.data;
+    if (!data) continue;
+    for (let t = 0; t < timeSteps.length; t++) {
+      const idx = t * (numY * numX) + nearestJ * numX + nearestI;
+      if (data[idx] > 0 && data[idx] <= 1e30) { exactHasData = true; break; }
+    }
+    if (exactHasData) break;
+  }
+
+  let activeJ = nearestJ;
+  let activeI = nearestI;
+  let snappedToFog = false;
+  let snapDistanceKm = 0;
+
+  // If exact cell is all zeros, search neighborhood radius R = 6 cells (~4-5 km) for closest cell with fog data
+  if (!exactHasData) {
+    const R = 6;
+    let minSquareDist = Infinity;
+    let foundJ = nearestJ;
+    let foundI = nearestI;
+
+    const jMin = Math.max(0, nearestJ - R);
+    const jMax = Math.min(numY - 1, nearestJ + R);
+    const iMin = Math.max(0, nearestI - R);
+    const iMax = Math.min(numX - 1, nearestI + R);
+
+    for (let j = jMin; j <= jMax; j++) {
+      for (let i = iMin; i <= iMax; i++) {
+        let cellHasData = false;
+        for (const vName of varKeys) {
+          const data = state.ncData.variables[vName]?.data;
+          if (!data) continue;
+          for (let t = 0; t < timeSteps.length; t++) {
+            const idx = t * (numY * numX) + j * numX + i;
+            if (data[idx] > 0 && data[idx] <= 1e30) { cellHasData = true; break; }
+          }
+          if (cellHasData) break;
+        }
+
+        if (cellHasData) {
+          const distSq = (j - nearestJ) * (j - nearestJ) + (i - nearestI) * (i - nearestI);
+          if (distSq < minSquareDist) {
+            minSquareDist = distSq;
+            foundJ = j;
+            foundI = i;
+          }
+        }
+      }
+    }
+
+    if (minSquareDist < Infinity) {
+      activeJ = foundJ;
+      activeI = foundI;
+      snappedToFog = true;
+      const cellDist = Math.sqrt(minSquareDist);
+      snapDistanceKm = parseFloat((cellDist * 0.8).toFixed(1));
+      if (snapDistanceKm < 0.1) snapDistanceKm = 0.1;
+      console.log(`Clic exacto (j:${nearestJ}, i:${nearestI}) sin datos -> Ajustado a celda con niebla (j:${activeJ}, i:${activeI}) a ~${snapDistanceKm} km`);
+    }
+  }
+
+  const nearestGridX = xArr[activeI];
+  const nearestGridY = yArr[activeJ];
+
   const extracted = {};
-  const numY = yArr.length;
-  const numX = xArr.length;
 
-  Object.keys(state.ncData.variables).forEach((varName) => {
-    if (["x", "y", "lat", "lon", "time", "datetime"].includes(varName.toLowerCase())) return;
-
+  varKeys.forEach((varName) => {
     const vObj = state.ncData.variables[varName];
     const data = vObj.data;
     const values = [];
@@ -612,15 +680,11 @@ function queryAndPlot() {
       let val = null;
       if (data) {
         if (vObj.dimensions && vObj.dimensions.length === 3) {
-          const idx = t * (numY * numX) + nearestJ * numX + nearestI;
+          const idx = t * (numY * numX) + activeJ * numX + activeI;
           const raw = data[idx];
-          if (t === 0 && varName === Object.keys(state.ncData.variables).find(k => !["x","y","lat","lon","time","datetime"].includes(k.toLowerCase()))) {
-            console.log("data check " + varName + ": nearestJ=" + nearestJ + " nearestI=" + nearestI + " idx=" + idx + " val=" + raw + " dataLen=" + data.length);
-          }
-          // Keep 0 as a valid value; only discard NaN or fill values (>1e30)
           if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
         } else if (vObj.dimensions && vObj.dimensions.length === 2) {
-          const idx = nearestJ * numX + nearestI;
+          const idx = activeJ * numX + activeI;
           const raw = data[idx];
           if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
         } else if (data[t] !== undefined && !isNaN(data[t]) && data[t] <= 1e30) {
@@ -635,7 +699,7 @@ function queryAndPlot() {
   });
 
   state.extractedTimeSeries = {
-    targetX, targetY, nearestI, nearestJ, nearestGridX, nearestGridY, timeSteps, extracted
+    targetX, targetY, nearestI, nearestJ, activeI, activeJ, nearestGridX, nearestGridY, snappedToFog, snapDistanceKm, timeSteps, extracted
   };
 
   updateMetadataUI();
@@ -648,7 +712,11 @@ function updateMetadataUI() {
 
   if (state.extractedTimeSeries) {
     const ext = state.extractedTimeSeries;
-    metaGrid.textContent = `(i: ${ext.nearestI}, j: ${ext.nearestJ})`;
+    if (ext.snappedToFog) {
+      metaGrid.textContent = `(i: ${ext.activeI}, j: ${ext.activeJ}) [📍 Niebla a ~${ext.snapDistanceKm} km]`;
+    } else {
+      metaGrid.textContent = `(i: ${ext.nearestI}, j: ${ext.nearestJ})`;
+    }
     metaNearestCoords.textContent = `${ext.nearestGridX.toFixed(2)}, ${ext.nearestGridY.toFixed(2)}`;
     metaTimeCount.textContent = `${ext.timeSteps.length} pasos`;
   }
@@ -700,13 +768,18 @@ function renderPlot() {
     showarrow: false
   }] : [];
 
+  let titleText = `Perfil Extraído: ${state.activeFilename} (Este: ${ext.targetX.toLocaleString()}, Norte: ${ext.targetY.toLocaleString()})`;
+  if (ext.snappedToFog) {
+    titleText += ` — 📍 Punto con niebla más cercano (~${ext.snapDistanceKm} km)`;
+  }
+
   const layout = {
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(15, 23, 42, 0.6)",
     font: { color: "#94a3b8", family: "Inter, sans-serif" },
     title: {
-      text: `Perfil Extraído: ${state.activeFilename} (Este: ${ext.targetX.toLocaleString()}, Norte: ${ext.targetY.toLocaleString()})`,
-      font: { color: "#f8fafc", size: 13 }
+      text: titleText,
+      font: { color: "#f8fafc", size: 12 }
     },
     xaxis: { title: "Tiempo / Fecha", type: "category", gridcolor: "rgba(255,255,255,0.05)" },
     yaxis: { title: "Valor de Variable", gridcolor: "rgba(255,255,255,0.05)", rangemode: "tozero" },
