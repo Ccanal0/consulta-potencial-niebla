@@ -787,9 +787,11 @@ function getMapVariableName() {
   if (!varNames.length) return null;
 
   const selectedVar = varSelect ? varSelect.value : "all";
-  return selectedVar !== "all" && varNames.includes(selectedVar)
-    ? selectedVar
-    : varNames[0];
+  if (selectedVar !== "all" && varNames.includes(selectedVar)) return selectedVar;
+
+  // Con "Todas las variables", el mapa representa Wh para coincidir con el
+  // potencial exportado al Excel. LWC continúa disponible en el selector.
+  return varNames.find(name => name.toLowerCase() === "wh") || varNames[0];
 }
 
 function getGridCellEdges(values, index) {
@@ -852,7 +854,7 @@ function drawSelectedGridCell() {
   const units = variableData.units ? ` ${variableData.units}` : "";
   const outlineColor = hasPositiveValue ? "#ffffff" : "#ff3b30";
 
-  selectedCellLayer = L.rectangle(
+  const cellRectangle = L.rectangle(
     [[yEdges[0], xEdges[0]], [yEdges[1], xEdges[1]]],
     {
       pane: "selectedCellPane",
@@ -864,7 +866,28 @@ function drawSelectedGridCell() {
       fillOpacity: hasPositiveValue ? 0.04 : 0.72,
       interactive: false
     }
-  ).addTo(map);
+  );
+
+  const selectedLayers = [cellRectangle];
+
+  // Una celda puede ser menor que un píxel de pantalla cuando se visualiza
+  // toda la región. En ese caso su transparencia no alcanza a percibirse.
+  // Esta máscara circular, de tamaño constante en pantalla, elimina cualquier
+  // color bajo el punto exacto cuando el valor consultado es cero.
+  if (!hasPositiveValue) {
+    selectedLayers.push(L.circleMarker([state.lat, state.lon], {
+      pane: "selectedCellPane",
+      radius: 25,
+      color: "#ff3b30",
+      weight: 4,
+      opacity: 1,
+      fillColor: "#0f172a",
+      fillOpacity: 0.98,
+      interactive: false
+    }));
+  }
+
+  selectedCellLayer = L.layerGroup(selectedLayers).addTo(map);
 
   marker.setIcon(createMapMarkerIcon(hasPositiveValue ? "#22c55e" : "#ef4444", hasPositiveValue ? "✓" : "0"));
   marker.unbindTooltip();
@@ -873,6 +896,7 @@ function drawSelectedGridCell() {
     `i=${ext.activeI}, j=${ext.activeJ}`,
     { direction: "top", offset: [0, -14], className: "amaru-cell-tooltip", opacity: 1 }
   );
+  if (!hasPositiveValue) marker.openTooltip();
 
   return { variable, annualValue, formattedValue: `${formattedValue}${units}` };
 }
