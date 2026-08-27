@@ -46,7 +46,29 @@ const metaTimeCount = document.getElementById("meta-time-count");
 let map, marker, regionPolygonsGroup;
 let ncOverlayLayer = null;
 let ncLegendControl = null;
+let selectedCellLayer = null;
 let coordinateInputTimer = null;
+
+function createMapMarkerIcon(color = "#38bdf8", label = "") {
+  return L.divIcon({
+    className: "custom-map-marker",
+    html: `<div style="
+      background:${color};
+      width:22px;
+      height:22px;
+      border-radius:50%;
+      border:3px solid #ffffff;
+      box-shadow:0 0 0 2px rgba(15,23,42,0.75),0 0 14px ${color};
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#ffffff;
+      font:bold 11px Inter,sans-serif;
+    ">${label}</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14]
+  });
+}
 
 document.addEventListener("DOMContentLoaded", async () => {
   initMap();
@@ -110,6 +132,20 @@ function initMap() {
     contrastStyle.textContent = `
       .amaru-satellite-contrast {
         filter: grayscale(48%) saturate(52%) brightness(68%) contrast(118%);
+      }
+      .amaru-fog-raster {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+      .amaru-cell-tooltip {
+        background: rgba(15,23,42,0.96);
+        border: 1px solid rgba(255,255,255,0.65);
+        color: #f8fafc;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+        font: 600 12px Inter,sans-serif;
+      }
+      .amaru-cell-tooltip::before {
+        border-top-color: rgba(15,23,42,0.96) !important;
       }
     `;
     document.head.appendChild(contrastStyle);
@@ -181,14 +217,16 @@ function initMap() {
 
   regionPolygonsGroup = L.layerGroup().addTo(map);
 
-  const customIcon = L.divIcon({
-    className: "custom-map-marker",
-    html: `<div style="background:#38bdf8; width:16px; height:16px; border-radius:50%; border:3px solid #ffffff; box-shadow:0 0 12px #38bdf8;"></div>`,
-    iconSize: [16, 16],
-    iconAnchor: [8, 8]
-  });
+  // Pane independiente: mantiene el contorno de la celda consultada por
+  // encima del ráster, pero por debajo del marcador y sus etiquetas.
+  map.createPane("selectedCellPane");
+  map.getPane("selectedCellPane").style.zIndex = 590;
+  map.getPane("selectedCellPane").style.pointerEvents = "none";
 
-  marker = L.marker([-33.4372, -70.6506], { draggable: true, icon: customIcon }).addTo(map);
+  marker = L.marker([-33.4372, -70.6506], {
+    draggable: true,
+    icon: createMapMarkerIcon()
+  }).addTo(map);
 
   marker.on("dragend", (e) => {
     const latLng = e.target.getLatLng();
@@ -244,7 +282,11 @@ function setupEventListeners() {
     exportToExcel();
   });
 
-  varSelect.addEventListener("change", () => { renderPlot(); drawNetCDFOverlay(); });
+  varSelect.addEventListener("change", () => {
+    renderPlot();
+    drawNetCDFOverlay();
+    drawSelectedGridCell();
+  });
 }
 
 async function loadCatalogAndIndex() {
@@ -730,7 +772,109 @@ function queryAndPlot() {
 
   updateMetadataUI();
   renderPlot();
-  statusText.textContent = `Consulta actualizada: Lat ${state.lat.toFixed(4)}, Lon ${state.lon.toFixed(4)}`;
+  const selectedCellInfo = drawSelectedGridCell();
+  const valueText = selectedCellInfo
+    ? ` · ${selectedCellInfo.variable}: ${selectedCellInfo.formattedValue}`
+    : "";
+  statusText.textContent = `Consulta actualizada: Lat ${state.lat.toFixed(4)}, Lon ${state.lon.toFixed(4)}${valueText}`;
+}
+
+function getMapVariableName() {
+  if (!state.ncData || !state.ncData.variables) return null;
+  const varNames = Object.keys(state.ncData.variables).filter(
+    name => !["x", "y", "lat", "lon", "time", "datetime"].includes(name.toLowerCase())
+  );
+  if (!varNames.length) return null;
+
+  const selectedVar = varSelect ? varSelect.value : "all";
+  return selectedVar !== "all" && varNames.includes(selectedVar)
+    ? selectedVar
+    : varNames[0];
+}
+
+function getGridCellEdges(values, index) {
+  if (!values || !values.length || index < 0 || index >= values.length) return null;
+  const center = Number(values[index]);
+  if (!Number.isFinite(center)) return null;
+
+  if (values.length === 1) return [center - 0.00005, center + 0.00005];
+
+  const previous = index > 0
+    ? Number(values[index - 1])
+    : center - (Number(values[index + 1]) - center);
+  const next = index < values.length - 1
+    ? Number(values[index + 1])
+    : center + (center - Number(values[index - 1]));
+  const edgeA = (previous + center) / 2;
+  const edgeB = (center + next) / 2;
+  return [Math.min(edgeA, edgeB), Math.max(edgeA, edgeB)];
+}
+
+function getGridExtentEdges(values) {
+  if (!values || !values.length) return null;
+  if (values.length === 1) {
+    const value = Number(values[0]);
+    return [value - 0.00005, value + 0.00005];
+  }
+
+  const first = Number(values[0]);
+  const second = Number(values[1]);
+  const last = Number(values[values.length - 1]);
+  const penultimate = Number(values[values.length - 2]);
+  const firstEdge = first - (second - first) / 2;
+  const lastEdge = last + (last - penultimate) / 2;
+  return [Math.min(firstEdge, lastEdge), Math.max(firstEdge, lastEdge)];
+}
+
+function drawSelectedGridCell() {
+  if (!map || !state.ncData || !state.extractedTimeSeries) return null;
+
+  if (selectedCellLayer) {
+    map.removeLayer(selectedCellLayer);
+    selectedCellLayer = null;
+  }
+
+  const ext = state.extractedTimeSeries;
+  const xEdges = getGridCellEdges(state.ncData.x, ext.activeI);
+  const yEdges = getGridCellEdges(state.ncData.y, ext.activeJ);
+  const variable = getMapVariableName();
+  const variableData = variable ? ext.extracted[variable] : null;
+  if (!xEdges || !yEdges || !variableData) return null;
+
+  const validValues = variableData.values.filter(
+    value => typeof value === "number" && Number.isFinite(value)
+  );
+  const annualValue = validValues.reduce((sum, value) => sum + value, 0);
+  const hasPositiveValue = annualValue > 0;
+  const formattedValue = Number.isFinite(annualValue)
+    ? annualValue.toLocaleString("es-CL", { maximumFractionDigits: 4 })
+    : "sin dato";
+  const units = variableData.units ? ` ${variableData.units}` : "";
+  const outlineColor = hasPositiveValue ? "#ffffff" : "#ff3b30";
+
+  selectedCellLayer = L.rectangle(
+    [[yEdges[0], xEdges[0]], [yEdges[1], xEdges[1]]],
+    {
+      pane: "selectedCellPane",
+      color: outlineColor,
+      weight: 3,
+      opacity: 1,
+      dashArray: hasPositiveValue ? null : "6 4",
+      fillColor: hasPositiveValue ? "#ffffff" : "#0f172a",
+      fillOpacity: hasPositiveValue ? 0.04 : 0.72,
+      interactive: false
+    }
+  ).addTo(map);
+
+  marker.setIcon(createMapMarkerIcon(hasPositiveValue ? "#22c55e" : "#ef4444", hasPositiveValue ? "✓" : "0"));
+  marker.unbindTooltip();
+  marker.bindTooltip(
+    `<b>Celda exacta consultada</b><br>${variable} Σ anual: ${formattedValue}${units}<br>` +
+    `i=${ext.activeI}, j=${ext.activeJ}`,
+    { direction: "top", offset: [0, -14], className: "amaru-cell-tooltip", opacity: 1 }
+  );
+
+  return { variable, annualValue, formattedValue: `${formattedValue}${units}` };
 }
 
 function updateMetadataUI() {
@@ -970,15 +1114,10 @@ function drawNetCDFOverlay() {
   const numX = xArr.length;
   const numY = yArr.length;
 
-  // Determinar variable a renderizar
-  const selectedVar = varSelect.value;
-  const varNames = Object.keys(state.ncData.variables).filter(
-    v => !["x", "y", "lat", "lon", "time", "datetime"].includes(v.toLowerCase())
-  );
-  if (!varNames.length) return;
-
-  const varToPlot = (selectedVar !== "all" && varNames.includes(selectedVar))
-    ? selectedVar : varNames[0];
+  // La misma variable gobierna el ráster, la leyenda y el valor mostrado en
+  // la celda seleccionada, evitando mensajes visuales contradictorios.
+  const varToPlot = getMapVariableName();
+  if (!varToPlot) return;
 
   const vObj = state.ncData.variables[varToPlot];
   const data = vObj ? vObj.data : null;
@@ -1082,18 +1221,26 @@ function drawNetCDFOverlay() {
   }
   ctx.putImageData(imgData, 0, 0);
 
-  // Calcular bounding box geográfico
-  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-  for (const v of yArr) { if (v < minLat) minLat = v; if (v > maxLat) maxLat = v; }
-  for (const v of xArr) { if (v < minLon) minLon = v; if (v > maxLon) maxLon = v; }
+  // Las coordenadas NetCDF representan centros de celdas. Leaflet necesita
+  // los bordes externos del ráster; usar los centros como límites desplazaba
+  // visualmente la capa aproximadamente media celda.
+  const lonExtent = getGridExtentEdges(xArr);
+  const latExtent = getGridExtentEdges(yArr);
+  if (!lonExtent || !latExtent) return;
+  const [minLon, maxLon] = lonExtent;
+  const [minLat, maxLat] = latExtent;
 
   // Agregar overlay al mapa
   const imageUrl = canvas.toDataURL("image/png");
   ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
     opacity: 0.96,
     interactive: false,
-    zIndex: 200
+    zIndex: 200,
+    className: "amaru-fog-raster"
   }).addTo(map);
+
+  // Reponer el contorno por encima del nuevo ráster cuando cambia la variable.
+  if (state.extractedTimeSeries) drawSelectedGridCell();
 
   // Ajustar vista del mapa a los límites del dataset
   map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
