@@ -100,11 +100,44 @@ async function initH5Wasm() {
 function initMap() {
   map = L.map("map", { center: [-30.0, -71.0], zoom: 6 });
 
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-    attribution: '&copy; Colaboradores de OpenStreetMap &copy; CARTO',
-    subdomains: "abcd",
-    maxZoom: 19
-  }).addTo(map);
+  // Mapa base sin API Key. El modo híbrido combina imagen satelital y
+  // referencias geográficas; el usuario puede cambiarlo a callejero.
+  const satelite = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: "Tiles © Esri"
+    }
+  );
+
+  const etiquetasSatelite = L.tileLayer(
+    "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: "Labels © Esri"
+    }
+  );
+
+  const mapaHibrido = L.layerGroup([satelite, etiquetasSatelite]);
+
+  const mapaCallejero = L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+      maxZoom: 19,
+      attribution: "© OpenStreetMap contributors"
+    }
+  );
+
+  mapaHibrido.addTo(map);
+
+  L.control.layers(
+    {
+      "Satélite híbrido": mapaHibrido,
+      "Mapa callejero": mapaCallejero
+    },
+    {},
+    { position: "topright", collapsed: true }
+  ).addTo(map);
 
   regionPolygonsGroup = L.layerGroup().addTo(map);
 
@@ -815,16 +848,17 @@ function drawNetCDFOverlay() {
     return;
   }
 
-  // Mapa de colores azules para datos de niebla/agua líquida
+  // Rampa de alto contraste para imagen satelital. Los valores nulos y cero
+  // quedan transparentes para que se vea el terreno bajo la capa de niebla.
   function fogColormap(norm) {
     if (norm <= 0) return [0, 0, 0, 0]; // transparente
     const stops = [
-      [0.001, [8,   48,  107, 30]],
-      [0.15,  [8,   81,  156, 120]],
-      [0.35,  [33,  113, 181, 175]],
-      [0.60,  [66,  146, 198, 210]],
-      [0.80,  [107, 174, 214, 235]],
-      [1.00,  [198, 219, 239, 255]]
+      [0.001, [0,   180, 255, 25]],
+      [0.15,  [0,   195, 255, 75]],
+      [0.35,  [0,   150, 255, 130]],
+      [0.60,  [85,  220, 255, 180]],
+      [0.80,  [255, 220, 90,  220]],
+      [1.00,  [255, 255, 235, 245]]
     ];
     for (let s = 1; s < stops.length; s++) {
       if (norm <= stops[s][0]) {
@@ -872,7 +906,7 @@ function drawNetCDFOverlay() {
   // Agregar overlay al mapa
   const imageUrl = canvas.toDataURL("image/png");
   ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
-    opacity: 0.82,
+    opacity: 0.65,
     interactive: false,
     zIndex: 200
   }).addTo(map);
@@ -905,10 +939,11 @@ function drawNetCDFOverlay() {
           height:12px;
           border-radius:4px;
           background: linear-gradient(to right,
-            rgba(8,48,107,0.4),
-            rgb(33,110,180),
-            rgb(107,174,214),
-            rgb(198,219,239)
+            rgba(0,180,255,0.20),
+            rgb(0,150,255),
+            rgb(85,220,255),
+            rgb(255,220,90),
+            rgb(255,255,235)
           );
           margin-bottom:4px;
         "></div>
