@@ -46,6 +46,7 @@ const metaTimeCount = document.getElementById("meta-time-count");
 let map, marker, regionPolygonsGroup;
 let ncOverlayLayer = null;
 let ncLegendControl = null;
+let coordinateInputTimer = null;
 
 document.addEventListener("DOMContentLoaded", async () => {
   initMap();
@@ -178,8 +179,14 @@ function setupEventListeners() {
     updateCoordsFromLatLon(state.lat, state.lon);
   });
 
-  eastingInput.addEventListener("input", updateCoordsFromInputs);
-  northingInput.addEventListener("input", updateCoordsFromInputs);
+  // Evita recalcular el gráfico en cada tecla mientras el usuario escribe.
+  // La consulta se ejecuta 300 ms después de la última modificación.
+  const scheduleCoordinateQuery = () => {
+    window.clearTimeout(coordinateInputTimer);
+    coordinateInputTimer = window.setTimeout(updateCoordsFromInputs, 300);
+  };
+  eastingInput.addEventListener("input", scheduleCoordinateQuery);
+  northingInput.addEventListener("input", scheduleCoordinateQuery);
 
   datasetSelect.addEventListener("change", () => {
     const selected = datasetSelect.value;
@@ -587,7 +594,10 @@ function populateVariableSelect() {
 }
 
 function queryAndPlot() {
-  if (!state.ncData) return;
+  if (!state.ncData) {
+    statusText.textContent = "Esperando la carga del archivo NetCDF...";
+    return;
+  }
 
   const targetX = state.easting;
   const targetY = state.northing;
@@ -681,6 +691,7 @@ function queryAndPlot() {
 
   updateMetadataUI();
   renderPlot();
+  statusText.textContent = `Consulta actualizada: Lat ${state.lat.toFixed(4)}, Lon ${state.lon.toFixed(4)}`;
 }
 
 function updateMetadataUI() {
@@ -705,43 +716,76 @@ function renderPlot() {
   const ext = state.extractedTimeSeries;
   const selectedVar = varSelect.value;
   const timeX = ext.timeSteps;
+  const monthNames = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+  const timeLabels = timeX.map((value, index) => {
+    const match = String(value).match(/((?:19|20)\d{2})-(\d{2})/);
+    if (!match) return String(value);
+    const monthIndex = Math.max(0, Math.min(11, Number(match[2]) - 1));
+    return `${monthNames[monthIndex]} ${match[1]}`;
+  });
 
   const traces = [];
   const colors = ["#38bdf8", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"];
+  const fillColors = ["rgba(56,189,248,0.10)", "rgba(16,185,129,0.10)", "rgba(245,158,11,0.10)", "rgba(139,92,246,0.10)", "rgba(236,72,153,0.10)"];
   let colorIdx = 0;
 
-  Object.keys(ext.extracted).forEach((varName) => {
-    if (selectedVar !== "all" && selectedVar !== varName) return;
+  const selectedNames = Object.keys(ext.extracted).filter(
+    varName => selectedVar === "all" || selectedVar === varName
+  );
+  const hasWh = selectedNames.some(name => name.toLowerCase() === "wh");
+  const hasOtherVariable = selectedNames.some(name => name.toLowerCase() !== "wh");
+  const useSecondAxis = hasWh && hasOtherVariable;
 
+  selectedNames.forEach((varName) => {
     const vData = ext.extracted[varName];
-    // Check if all values are null (no readable data at this point)
-    const hasData = vData.values.some(v => v !== null);
+    const hasData = vData.values.some(v => typeof v === "number" && Number.isFinite(v));
     const allZero = hasData && vData.values.every(v => v === null || v === 0);
+    const traceUsesSecondAxis = useSecondAxis && varName.toLowerCase() === "wh";
 
     traces.push({
-      x: timeX,
+      x: timeLabels,
       y: vData.values,
       type: "scatter",
       mode: "lines+markers",
-      name: `${varName} ${vData.units ? "(" + vData.units + ")" : ""}` + (allZero ? " [sin datos en este punto]" : ""),
+      name: `${varName} ${vData.units ? "(" + vData.units + ")" : ""}` + (allZero ? " [valor 0]" : ""),
       connectgaps: false,
-      line: { color: colors[colorIdx % colors.length], width: 2 },
-      marker: { size: 5, color: colors[colorIdx % colors.length] }
+      line: { color: colors[colorIdx % colors.length], width: 3 },
+      marker: {
+        size: 7,
+        color: colors[colorIdx % colors.length],
+        line: { color: "#e2e8f0", width: 1 }
+      },
+      fill: "tozeroy",
+      fillcolor: fillColors[colorIdx % fillColors.length],
+      yaxis: traceUsesSecondAxis ? "y2" : "y",
+      customdata: timeX,
+      hovertemplate:
+        `<b>${varName}</b><br>` +
+        `Fecha: %{customdata}<br>` +
+        `Valor: %{y:.4f}${vData.units ? " " + vData.units : ""}<extra></extra>`
     });
     colorIdx++;
   });
 
-  // Detect if every extracted trace is entirely null/zero at this location
-  const allTracesEmpty = Object.keys(ext.extracted).every(varName => {
-    if (selectedVar !== "all" && selectedVar !== varName) return true;
-    return ext.extracted[varName].values.every(v => v === null || v === 0);
-  });
+  const selectedValues = selectedNames.flatMap(varName => ext.extracted[varName].values);
+  const hasAnyValidValue = selectedValues.some(v => typeof v === "number" && Number.isFinite(v));
+  const hasAnyPositiveValue = selectedValues.some(v => typeof v === "number" && Number.isFinite(v) && v > 0);
 
-  const annotations = allTracesEmpty ? [{
+  const emptyMessage = !hasAnyValidValue
+    ? "No hay datos legibles en la celda original seleccionada"
+    : !hasAnyPositiveValue
+      ? "Celda original válida: valor 0 durante todos los meses (sin niebla registrada)"
+      : null;
+
+  const annotations = emptyMessage ? [{
     x: 0.5, y: 0.5,
     xref: "paper", yref: "paper",
-    text: "Sin niebla registrada en este punto de la malla",
-    font: { color: "#94a3b8", size: 14 },
+    text: emptyMessage,
+    font: { color: "#cbd5e1", size: 15 },
+    bgcolor: "rgba(15,23,42,0.88)",
+    bordercolor: "rgba(56,189,248,0.45)",
+    borderwidth: 1,
+    borderpad: 10,
     showarrow: false
   }] : [];
 
@@ -750,22 +794,113 @@ function renderPlot() {
     titleText += ` — 📍 Punto con niebla más cercano (~${ext.snapDistanceKm} km)`;
   }
 
-  const layout = {
-    paper_bgcolor: "rgba(0,0,0,0)",
-    plot_bgcolor: "rgba(15, 23, 42, 0.6)",
-    font: { color: "#94a3b8", family: "Inter, sans-serif" },
-    title: {
-      text: titleText,
-      font: { color: "#f8fafc", size: 12 }
-    },
-    xaxis: { title: "Tiempo / Fecha", type: "category", gridcolor: "rgba(255,255,255,0.05)" },
-    yaxis: { title: "Valor de Variable", gridcolor: "rgba(255,255,255,0.05)", rangemode: "tozero" },
-    margin: { l: 60, r: 30, t: 50, b: 50 },
-    legend: { orientation: "h", y: 1.15 },
-    annotations
+  const primaryName = selectedNames.find(name => !useSecondAxis || name.toLowerCase() !== "wh") || selectedNames[0] || "Variable";
+  const primaryUnits = ext.extracted[primaryName]?.units || "";
+  const whName = selectedNames.find(name => name.toLowerCase() === "wh");
+  const whUnits = whName ? (ext.extracted[whName]?.units || "") : "";
+
+  const yAxisCommon = {
+    showgrid: true,
+    gridcolor: "rgba(148,163,184,0.20)",
+    gridwidth: 1,
+    showline: true,
+    linecolor: "rgba(148,163,184,0.55)",
+    linewidth: 1,
+    zeroline: true,
+    zerolinecolor: "rgba(226,232,240,0.55)",
+    zerolinewidth: 1,
+    tickfont: { color: "#cbd5e1", size: 12 },
+    tickformat: ".3~f",
+    automargin: true,
+    rangemode: "tozero",
+    fixedrange: false
   };
 
-  Plotly.newPlot("plot-container", traces, layout, { responsive: true, displaylogo: false });
+  const layout = {
+    height: 460,
+    autosize: true,
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(15,23,42,0.78)",
+    font: { color: "#cbd5e1", family: "Inter, sans-serif", size: 12 },
+    title: {
+      text: titleText,
+      x: 0.5,
+      xanchor: "center",
+      y: 0.97,
+      font: { color: "#f8fafc", size: 13 }
+    },
+    xaxis: {
+      title: { text: "Mes", standoff: 18, font: { color: "#e2e8f0", size: 13 } },
+      type: "category",
+      categoryorder: "array",
+      categoryarray: timeLabels,
+      showgrid: true,
+      gridcolor: "rgba(148,163,184,0.16)",
+      showline: true,
+      linecolor: "rgba(148,163,184,0.55)",
+      tickfont: { color: "#cbd5e1", size: 11 },
+      tickangle: -30,
+      automargin: true,
+      fixedrange: false
+    },
+    yaxis: {
+      ...yAxisCommon,
+      title: {
+        text: `${primaryName}${primaryUnits ? " (" + primaryUnits + ")" : ""}`,
+        standoff: 14,
+        font: { color: "#e2e8f0", size: 13 }
+      },
+      ...(!hasAnyPositiveValue ? { range: [0, 1] } : {})
+    },
+    ...(useSecondAxis ? {
+      yaxis2: {
+        ...yAxisCommon,
+        title: {
+          text: `${whName}${whUnits ? " (" + whUnits + ")" : ""}`,
+          standoff: 14,
+          font: { color: "#e2e8f0", size: 13 }
+        },
+        overlaying: "y",
+        side: "right",
+        showgrid: false,
+        ...(!hasAnyPositiveValue ? { range: [0, 1] } : {})
+      }
+    } : {}),
+    margin: { l: 88, r: useSecondAxis ? 92 : 36, t: 92, b: 86, pad: 4 },
+    legend: {
+      orientation: "h",
+      x: 0,
+      y: 1.13,
+      xanchor: "left",
+      yanchor: "bottom",
+      bgcolor: "rgba(15,23,42,0.65)",
+      bordercolor: "rgba(148,163,184,0.20)",
+      borderwidth: 1,
+      font: { color: "#e2e8f0", size: 12 }
+    },
+    hovermode: "x unified",
+    hoverlabel: {
+      bgcolor: "#0f172a",
+      bordercolor: "#38bdf8",
+      font: { color: "#f8fafc", family: "Inter, sans-serif" }
+    },
+    annotations,
+    transition: { duration: 250, easing: "cubic-in-out" }
+  };
+
+  const plotElement = document.getElementById("plot-container");
+  const plotConfig = {
+    responsive: true,
+    displaylogo: false,
+    scrollZoom: false,
+    modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"]
+  };
+
+  // React actualiza el mismo gráfico. Es más estable y evita que el contenedor
+  // crezca o quede vacío después de consultar y descargar varias veces.
+  Plotly.react(plotElement, traces, layout, plotConfig).then(() => {
+    window.requestAnimationFrame(() => Plotly.Plots.resize(plotElement));
+  });
 }
 
 /**
@@ -837,10 +972,13 @@ function drawNetCDFOverlay() {
     }
   }
 
-  // Calcular valor máximo para normalización
+  // Calcular valor máximo real y percentil 98 para la escala visual.
+  // El P98 evita que una sola celda extrema vuelva invisible el resto de la niebla.
   let maxVal = 0;
+  const positiveDisplayValues = [];
   for (let k = 0; k < grid2d.length; k++) {
     if (grid2d[k] > maxVal) maxVal = grid2d[k];
+    if (grid2d[k] > 0 && Number.isFinite(grid2d[k])) positiveDisplayValues.push(grid2d[k]);
   }
 
   if (maxVal === 0) {
@@ -848,17 +986,22 @@ function drawNetCDFOverlay() {
     return;
   }
 
+  positiveDisplayValues.sort((a, b) => a - b);
+  const p98Index = Math.max(0, Math.floor((positiveDisplayValues.length - 1) * 0.98));
+  const displayMax = positiveDisplayValues[p98Index] || maxVal;
+
   // Rampa de alto contraste para imagen satelital. Los valores nulos y cero
   // quedan transparentes para que se vea el terreno bajo la capa de niebla.
   function fogColormap(norm) {
     if (norm <= 0) return [0, 0, 0, 0]; // transparente
     const stops = [
-      [0.001, [0,   180, 255, 25]],
-      [0.15,  [0,   195, 255, 75]],
-      [0.35,  [0,   150, 255, 130]],
-      [0.60,  [85,  220, 255, 180]],
-      [0.80,  [255, 220, 90,  220]],
-      [1.00,  [255, 255, 235, 245]]
+      [0.001, [0,   229, 255, 70]],
+      [0.15,  [0,   174, 255, 145]],
+      [0.35,  [0,   102, 255, 195]],
+      [0.58,  [124, 58,  237, 220]],
+      [0.78,  [255, 45,  149, 240]],
+      [0.92,  [255, 176, 0,   250]],
+      [1.00,  [255, 247, 174, 255]]
     ];
     for (let s = 1; s < stops.length; s++) {
       if (norm <= stops[s][0]) {
@@ -887,7 +1030,9 @@ function drawNetCDFOverlay() {
     const rowBase = dataJ * numX;
     const canvasBase = j * numX;
     for (let i = 0; i < numX; i++) {
-      const norm = grid2d[rowBase + i] / maxVal;
+      const rawNorm = Math.min(1, grid2d[rowBase + i] / displayMax);
+      // Corrección gamma: expande los valores bajos y medios para hacerlos visibles.
+      const norm = rawNorm > 0 ? Math.pow(rawNorm, 0.48) : 0;
       const [r, g, b, a] = fogColormap(norm);
       const px = (canvasBase + i) * 4;
       imgData.data[px]     = r;
@@ -906,7 +1051,7 @@ function drawNetCDFOverlay() {
   // Agregar overlay al mapa
   const imageUrl = canvas.toDataURL("image/png");
   ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
-    opacity: 0.65,
+    opacity: 0.88,
     interactive: false,
     zIndex: 200
   }).addTo(map);
@@ -939,19 +1084,21 @@ function drawNetCDFOverlay() {
           height:12px;
           border-radius:4px;
           background: linear-gradient(to right,
-            rgba(0,180,255,0.20),
-            rgb(0,150,255),
-            rgb(85,220,255),
-            rgb(255,220,90),
-            rgb(255,255,235)
+            rgba(0,229,255,0.35),
+            rgb(0,174,255),
+            rgb(0,102,255),
+            rgb(124,58,237),
+            rgb(255,45,149),
+            rgb(255,176,0),
+            rgb(255,247,174)
           );
           margin-bottom:4px;
         "></div>
         <div style="display:flex;justify-content:space-between;font-size:10px;">
           <span>0</span>
-          <span>${maxVal.toFixed(2)}</span>
+          <span>${displayMax.toFixed(2)}</span>
         </div>
-        <div style="margin-top:5px;font-size:10px;color:#64748b;">Σ anual (todos los meses)</div>
+        <div style="margin-top:5px;font-size:10px;color:#64748b;">Σ anual · escala visual P98</div>
       </div>
     `;
     return div;
