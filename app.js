@@ -101,25 +101,63 @@ async function initH5Wasm() {
 function initMap() {
   map = L.map("map", { center: [-30.0, -71.0], zoom: 6 });
 
+  // Atenuar el verde y el azul del fondo satelital permite que la capa de
+  // niebla cálida se distinga con claridad. La alternativa de color original
+  // continúa disponible en el selector de capas.
+  if (!document.getElementById("amaru-map-contrast-style")) {
+    const contrastStyle = document.createElement("style");
+    contrastStyle.id = "amaru-map-contrast-style";
+    contrastStyle.textContent = `
+      .amaru-satellite-contrast {
+        filter: grayscale(48%) saturate(52%) brightness(68%) contrast(118%);
+      }
+    `;
+    document.head.appendChild(contrastStyle);
+  }
+
+  const satelliteUrl =
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+  const labelsUrl =
+    "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}";
+
   // Mapa base sin API Key. El modo híbrido combina imagen satelital y
-  // referencias geográficas; el usuario puede cambiarlo a callejero.
-  const satelite = L.tileLayer(
-    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  // referencias geográficas; el usuario puede cambiarlo a color original.
+  const sateliteContraste = L.tileLayer(
+    satelliteUrl,
     {
       maxZoom: 19,
-      attribution: "Tiles © Esri"
+      attribution: "Tiles © Esri",
+      className: "amaru-satellite-contrast"
     }
   );
 
-  const etiquetasSatelite = L.tileLayer(
-    "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+  const etiquetasContraste = L.tileLayer(
+    labelsUrl,
     {
       maxZoom: 19,
       attribution: "Labels © Esri"
     }
   );
 
-  const mapaHibrido = L.layerGroup([satelite, etiquetasSatelite]);
+  const mapaHibridoContraste = L.layerGroup([sateliteContraste, etiquetasContraste]);
+
+  const sateliteOriginal = L.tileLayer(
+    satelliteUrl,
+    {
+      maxZoom: 19,
+      attribution: "Tiles © Esri"
+    }
+  );
+
+  const etiquetasOriginal = L.tileLayer(
+    labelsUrl,
+    {
+      maxZoom: 19,
+      attribution: "Labels © Esri"
+    }
+  );
+
+  const mapaHibridoOriginal = L.layerGroup([sateliteOriginal, etiquetasOriginal]);
 
   const mapaCallejero = L.tileLayer(
     "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -129,11 +167,12 @@ function initMap() {
     }
   );
 
-  mapaHibrido.addTo(map);
+  mapaHibridoContraste.addTo(map);
 
   L.control.layers(
     {
-      "Satélite híbrido": mapaHibrido,
+      "Satélite — contraste de niebla": mapaHibridoContraste,
+      "Satélite — color original": mapaHibridoOriginal,
       "Mapa callejero": mapaCallejero
     },
     {},
@@ -990,18 +1029,18 @@ function drawNetCDFOverlay() {
   const p98Index = Math.max(0, Math.floor((positiveDisplayValues.length - 1) * 0.98));
   const displayMax = positiveDisplayValues[p98Index] || maxVal;
 
-  // Rampa de alto contraste para imagen satelital. Los valores nulos y cero
-  // quedan transparentes para que se vea el terreno bajo la capa de niebla.
+  // Rampa cálida de alto contraste. Se evita deliberadamente el azul porque
+  // se confunde con el mar, sombras y vegetación del fondo satelital.
+  // Los valores nulos y cero permanecen completamente transparentes.
   function fogColormap(norm) {
     if (norm <= 0) return [0, 0, 0, 0]; // transparente
     const stops = [
-      [0.001, [0,   229, 255, 70]],
-      [0.15,  [0,   174, 255, 145]],
-      [0.35,  [0,   102, 255, 195]],
-      [0.58,  [124, 58,  237, 220]],
-      [0.78,  [255, 45,  149, 240]],
-      [0.92,  [255, 176, 0,   250]],
-      [1.00,  [255, 247, 174, 255]]
+      [0.001, [255, 0,   255, 190]],
+      [0.18,  [185, 0,   255, 215]],
+      [0.38,  [255, 0,   100, 235]],
+      [0.62,  [255, 80,  0,   245]],
+      [0.82,  [255, 215, 0,   252]],
+      [1.00,  [255, 255, 255, 255]]
     ];
     for (let s = 1; s < stops.length; s++) {
       if (norm <= stops[s][0]) {
@@ -1032,7 +1071,7 @@ function drawNetCDFOverlay() {
     for (let i = 0; i < numX; i++) {
       const rawNorm = Math.min(1, grid2d[rowBase + i] / displayMax);
       // Corrección gamma: expande los valores bajos y medios para hacerlos visibles.
-      const norm = rawNorm > 0 ? Math.pow(rawNorm, 0.48) : 0;
+      const norm = rawNorm > 0 ? Math.pow(rawNorm, 0.42) : 0;
       const [r, g, b, a] = fogColormap(norm);
       const px = (canvasBase + i) * 4;
       imgData.data[px]     = r;
@@ -1051,7 +1090,7 @@ function drawNetCDFOverlay() {
   // Agregar overlay al mapa
   const imageUrl = canvas.toDataURL("image/png");
   ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
-    opacity: 0.88,
+    opacity: 0.96,
     interactive: false,
     zIndex: 200
   }).addTo(map);
@@ -1069,7 +1108,7 @@ function drawNetCDFOverlay() {
         background: rgba(15,23,42,0.88);
         padding: 10px 14px;
         border-radius: 10px;
-        border: 1px solid rgba(56,189,248,0.35);
+        border: 1px solid rgba(255,45,149,0.55);
         font-family: Inter, sans-serif;
         color: #94a3b8;
         font-size: 12px;
@@ -1084,13 +1123,12 @@ function drawNetCDFOverlay() {
           height:12px;
           border-radius:4px;
           background: linear-gradient(to right,
-            rgba(0,229,255,0.35),
-            rgb(0,174,255),
-            rgb(0,102,255),
-            rgb(124,58,237),
-            rgb(255,45,149),
-            rgb(255,176,0),
-            rgb(255,247,174)
+            rgba(255,0,255,0.75),
+            rgb(185,0,255),
+            rgb(255,0,100),
+            rgb(255,80,0),
+            rgb(255,215,0),
+            rgb(255,255,255)
           );
           margin-bottom:4px;
         "></div>
@@ -1098,7 +1136,8 @@ function drawNetCDFOverlay() {
           <span>0</span>
           <span>${displayMax.toFixed(2)}</span>
         </div>
-        <div style="margin-top:5px;font-size:10px;color:#64748b;">Σ anual · escala visual P98</div>
+        <div style="margin-top:5px;font-size:10px;color:#94a3b8;">Fucsia: bajo · amarillo/blanco: alto</div>
+        <div style="margin-top:2px;font-size:10px;color:#64748b;">Σ anual · escala visual P98</div>
       </div>
     `;
     return div;
