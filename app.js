@@ -602,69 +602,13 @@ function queryAndPlot() {
     k => !["x", "y", "lat", "lon", "time", "datetime"].includes(k.toLowerCase())
   );
 
-  // Check if exact cell has non-zero data
-  let exactHasData = false;
-  for (const vName of varKeys) {
-    const data = state.ncData.variables[vName]?.data;
-    if (!data) continue;
-    for (let t = 0; t < timeSteps.length; t++) {
-      const idx = t * (numY * numX) + nearestJ * numX + nearestI;
-      if (data[idx] > 0 && data[idx] <= 1e30) { exactHasData = true; break; }
-    }
-    if (exactHasData) break;
-  }
-
-  let activeJ = nearestJ;
-  let activeI = nearestI;
-  let snappedToFog = false;
-  let snapDistanceKm = 0;
-
-  // If exact cell is all zeros, search neighborhood radius R = 6 cells (~4-5 km) for closest cell with fog data
-  if (!exactHasData) {
-    const R = 6;
-    let minSquareDist = Infinity;
-    let foundJ = nearestJ;
-    let foundI = nearestI;
-
-    const jMin = Math.max(0, nearestJ - R);
-    const jMax = Math.min(numY - 1, nearestJ + R);
-    const iMin = Math.max(0, nearestI - R);
-    const iMax = Math.min(numX - 1, nearestI + R);
-
-    for (let j = jMin; j <= jMax; j++) {
-      for (let i = iMin; i <= iMax; i++) {
-        let cellHasData = false;
-        for (const vName of varKeys) {
-          const data = state.ncData.variables[vName]?.data;
-          if (!data) continue;
-          for (let t = 0; t < timeSteps.length; t++) {
-            const idx = t * (numY * numX) + j * numX + i;
-            if (data[idx] > 0 && data[idx] <= 1e30) { cellHasData = true; break; }
-          }
-          if (cellHasData) break;
-        }
-
-        if (cellHasData) {
-          const distSq = (j - nearestJ) * (j - nearestJ) + (i - nearestI) * (i - nearestI);
-          if (distSq < minSquareDist) {
-            minSquareDist = distSq;
-            foundJ = j;
-            foundI = i;
-          }
-        }
-      }
-    }
-
-    if (minSquareDist < Infinity) {
-      activeJ = foundJ;
-      activeI = foundI;
-      snappedToFog = true;
-      const cellDist = Math.sqrt(minSquareDist);
-      snapDistanceKm = parseFloat((cellDist * 0.8).toFixed(1));
-      if (snapDistanceKm < 0.1) snapDistanceKm = 0.1;
-      console.log(`Clic exacto (j:${nearestJ}, i:${nearestI}) sin datos -> Ajustado a celda con niebla (j:${activeJ}, i:${activeI}) a ~${snapDistanceKm} km`);
-    }
-  }
+  // Consulta estricta: se usa exclusivamente la celda original de la malla
+  // más cercana a la coordenada ingresada. Si esa celda contiene cero o no
+  // tiene niebla, se informa ese resultado sin buscar celdas positivas vecinas.
+  const activeJ = nearestJ;
+  const activeI = nearestI;
+  const snappedToFog = false;
+  const snapDistanceKm = 0;
 
   const nearestGridX = xArr[activeI];
   const nearestGridY = yArr[activeJ];
@@ -989,48 +933,424 @@ function exportToExcel() {
   }
 
   const ext = state.extractedTimeSeries;
-  const dataRows = [];
-
-  for (let t = 0; t < ext.timeSteps.length; t++) {
-    const row = {
-      "Tiempo / Paso": ext.timeSteps[t],
-      "Este Objetivo (X)": ext.targetX,
-      "Norte Objetivo (Y)": ext.targetY,
-      "Este Malla Cercana": ext.nearestGridX,
-      "Norte Malla Cercana": ext.nearestGridY
-    };
-
-    Object.keys(ext.extracted).forEach((varName) => {
-      row[varName] = ext.extracted[varName].values[t];
-    });
-
-    dataRows.push(row);
-  }
-
-  const worksheetData = XLSX.utils.json_to_sheet(dataRows);
-
-  const metaRows = [
-    { Propiedad: "Nombre del Dataset", Valor: state.activeFilename },
-    { Propiedad: "SRC Seleccionado", Valor: state.selectedCrs },
-    { Propiedad: "Este Objetivo (X)", Valor: ext.targetX },
-    { Propiedad: "Norte Objetivo (Y)", Valor: ext.targetY },
-    { Propiedad: "Latitud Calculada", Valor: state.lat },
-    { Propiedad: "Longitud Calculada", Valor: state.lon },
-    { Propiedad: "Índice i Malla (Columna)", Valor: ext.nearestI },
-    { Propiedad: "Índice j Malla (Fila)", Valor: ext.nearestJ },
-    { Propiedad: "Este Malla Cercana", Valor: ext.nearestGridX },
-    { Propiedad: "Norte Malla Cercana", Valor: ext.nearestGridY },
-    { Propiedad: "Total Pasos de Tiempo", Valor: ext.timeSteps.length },
-    { Propiedad: "Fecha de Exportación", Valor: new Date().toISOString() }
+  const meses = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
   ];
 
-  const worksheetMeta = XLSX.utils.json_to_sheet(metaRows);
+  const nombresVariables = Object.keys(ext.extracted);
+  if (nombresVariables.length === 0) {
+    alert("El archivo NetCDF no contiene variables disponibles para exportar.");
+    return;
+  }
+
+  // Si el usuario eligió una variable específica, se respeta. Si eligió
+  // "Todas", se prioriza Wh porque corresponde al potencial de captación.
+  const variableSeleccionada =
+    varSelect && varSelect.value !== "all" && ext.extracted[varSelect.value]
+      ? varSelect.value
+      : nombresVariables.find(nombre => nombre.toLowerCase() === "wh") || nombresVariables[0];
+
+  const datosVariable = ext.extracted[variableSeleccionada];
+  const esWh = variableSeleccionada.toLowerCase() === "wh";
+  const esLwc = variableSeleccionada.toLowerCase() === "lwc";
+  const tituloVariable = esWh
+    ? "Potencial de captación de niebla (Wh)"
+    : esLwc
+      ? "Contenido de agua líquida (LWC)"
+      : variableSeleccionada;
+  const unidadMensual = esWh
+    ? "L/m²/mes"
+    : esLwc
+      ? "g/kg"
+      : (datosVariable.units || "");
+  const unidadAnual = esWh ? "L/m²/año" : unidadMensual;
+
+  const valoresMensuales = datosVariable.values.map(valor =>
+    typeof valor === "number" && Number.isFinite(valor) ? valor : null
+  );
+  const valoresValidos = valoresMensuales.filter(valor => valor !== null);
+  const valoresPositivos = valoresValidos.filter(valor => valor > 0);
+
+  const suma = valoresValidos.reduce((acumulado, valor) => acumulado + valor, 0);
+  const promedio = valoresValidos.length > 0 ? suma / valoresValidos.length : null;
+  const resumenAnual = esWh ? suma : promedio;
+  const maximoMensual = valoresValidos.length > 0 ? Math.max(...valoresValidos) : null;
+  const indiceMaximo = maximoMensual === null
+    ? -1
+    : valoresMensuales.findIndex(valor => valor === maximoMensual);
+  const mesMaximo = indiceMaximo >= 0 ? meses[indiceMaximo % 12] : "Sin dato";
+
+  const region = obtenerRegionDesdeNombre(state.activeFilename);
+  const anioRepresentativo = obtenerAnioRepresentativo(ext.timeSteps, state.activeFilename);
+  const dentroExtension = coordenadaDentroDeExtension(state.lon, state.lat);
+  const estadisticas = calcularEstadisticasCapa(variableSeleccionada, esWh);
+
+  const latitudIngresada = redondear(state.lat, 6);
+  const longitudIngresada = redondear(state.lon, 6);
+  const latitudCelda = redondear(ext.nearestGridY, 12);
+  const longitudCelda = redondear(ext.nearestGridX, 12);
+
+  const resumen = [
+    ["REPORTE DE CONSULTA ESPACIAL AMARU", "", "", "", "", ""],
+    [],
+    ["1. IDENTIFICACIÓN Y COORDENADA", "", "", "", "", ""],
+    ["Región", region],
+    ["Año representativo", anioRepresentativo],
+    ["Variable", tituloVariable],
+    ["Capa espacial mostrada", esWh ? "Acumulado anual de Wh" : "Promedio anual de LWC"],
+    ["Mes de la capa", "No aplica"],
+    ["Unidad de la capa", unidadAnual],
+    ["Latitud ingresada", latitudIngresada],
+    ["Longitud ingresada", longitudIngresada],
+    ["Este UTM ingresado", ext.targetX],
+    ["Norte UTM ingresado", ext.targetY],
+    ["SRC de la coordenada ingresada", state.selectedCrs],
+    ["Latitud de la celda original", latitudCelda],
+    ["Longitud de la celda original", longitudCelda],
+    ["Coordenada dentro de la extensión", dentroExtension ? "Sí" : "No"],
+    ["Valor exacto correspondiente a la capa", resumenAnual],
+    [],
+    ["2. INDICADORES DE LA SERIE MENSUAL EXACTA", "", "", "", "", ""],
+    ["Indicador", "Valor", "Unidad"],
+    [esWh ? "Suma anual Wh" : "Promedio anual LWC", resumenAnual, unidadAnual],
+    ["Promedio mensual", promedio, unidadMensual],
+    ["Máximo mensual", maximoMensual, unidadMensual],
+    ["Mes del máximo", mesMaximo, ""],
+    ["Meses con valor positivo", valoresPositivos.length, "meses"],
+    ["Meses con dato válido", valoresValidos.length, "meses"],
+    [],
+    [
+      "La consulta utiliza exclusivamente la celda original más cercana a la coordenada ingresada. " +
+      "No se buscan, sustituyen ni interpretan celdas positivas cercanas.",
+      "", "", "", "", ""
+    ]
+  ];
+
+  const serieMensual = [[
+    "Mes_número", "Mes", "Fecha", "Valor_exacto", "Unidad", "Estado",
+    "Latitud_celda", "Longitud_celda"
+  ]];
+
+  valoresMensuales.forEach((valor, indice) => {
+    const estado = valor === null ? "Sin dato" : valor > 0 ? "Positivo" : "Cero";
+    serieMensual.push([
+      indice + 1,
+      meses[indice % 12],
+      ext.timeSteps[indice] || "",
+      valor,
+      unidadMensual,
+      estado,
+      latitudCelda,
+      longitudCelda
+    ]);
+  });
+
+  const estadisticasCapa = [
+    ["Indicador", "Valor", "Unidad"],
+    ["Celdas válidas", estadisticas.nValidos, "celdas"],
+    ["Celdas positivas", estadisticas.nPositivos, "celdas"],
+    ["Porcentaje positivo", estadisticas.porcentajePositivo, "%"],
+    ["Mínimo positivo", estadisticas.minimoPositivo, unidadAnual],
+    ["Percentil 25", estadisticas.p25, unidadAnual],
+    ["Mediana", estadisticas.mediana, unidadAnual],
+    ["Percentil 75", estadisticas.p75, unidadAnual],
+    ["Percentil 90", estadisticas.p90, unidadAnual],
+    ["Máximo", estadisticas.maximo, unidadAnual]
+  ];
+
+  const metadatos = [
+    ["Campo", "Valor"],
+    ["Fecha de generación", new Date().toLocaleString("es-CL")],
+    ["Región", region],
+    ["Año representativo", anioRepresentativo],
+    ["Variable", tituloVariable],
+    ["Capa mostrada", esWh ? "Acumulado anual de Wh" : "Promedio anual de LWC"],
+    ["Mes de la capa", "No aplica"],
+    ["Archivo NetCDF regional", state.activeFilename],
+    ["SRC ingresado", state.selectedCrs],
+    ["Este UTM ingresado", ext.targetX],
+    ["Norte UTM ingresado", ext.targetY],
+    ["Latitud ingresada", latitudIngresada],
+    ["Longitud ingresada", longitudIngresada],
+    ["Índice i de la celda original", ext.nearestI],
+    ["Índice j de la celda original", ext.nearestJ],
+    ["Latitud de la celda original", latitudCelda],
+    ["Longitud de la celda original", longitudCelda],
+    ["Total de pasos de tiempo", ext.timeSteps.length],
+    [
+      "Criterio de consulta",
+      "La serie mensual y el Excel usan exclusivamente la celda original más cercana a la coordenada ingresada."
+    ]
+  ];
 
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheetData, "Series de Tiempo");
-  XLSX.utils.book_append_sheet(workbook, worksheetMeta, "Metadatos");
+  const hojaResumen = XLSX.utils.aoa_to_sheet(resumen);
+  const hojaSerie = XLSX.utils.aoa_to_sheet(serieMensual);
+  const hojaEstadisticas = XLSX.utils.aoa_to_sheet(estadisticasCapa);
+  const hojaMetadatos = XLSX.utils.aoa_to_sheet(metadatos);
 
-  const fname = `AMARU_Extraccion_${state.activeFilename.replace('.nc','')}_X${Math.round(ext.targetX)}_Y${Math.round(ext.targetY)}.xlsx`;
-  XLSX.writeFile(workbook, fname);
-  statusText.textContent = "¡Excel Descargado!";
+  configurarHojaResumen(hojaResumen);
+  configurarHojaSerie(hojaSerie, serieMensual.length);
+  configurarHojaEstadisticas(hojaEstadisticas, estadisticasCapa.length);
+  configurarHojaMetadatos(hojaMetadatos, metadatos.length);
+
+  XLSX.utils.book_append_sheet(workbook, hojaResumen, "Resumen");
+  XLSX.utils.book_append_sheet(workbook, hojaSerie, "Serie_mensual");
+  XLSX.utils.book_append_sheet(workbook, hojaEstadisticas, "Estadisticas_capa");
+  XLSX.utils.book_append_sheet(workbook, hojaMetadatos, "Metadatos");
+
+  const latNombre = Number(state.lat).toFixed(2);
+  const lonNombre = Number(state.lon).toFixed(2);
+  const nombreArchivo = `AMARU_${nombreSeguro(region)}_Lat${latNombre}_Lon${lonNombre}.xlsx`;
+
+  XLSX.writeFile(workbook, nombreArchivo, { compression: true });
+  statusText.textContent = `Excel descargado: ${nombreArchivo}`;
+}
+
+function obtenerRegionDesdeNombre(nombreArchivo) {
+  if (!nombreArchivo) return "Sin_region";
+
+  const nombres = [
+    "Arica", "Tarapaca", "Antofagasta", "Atacama", "Coquimbo",
+    "Valparaiso", "OHiggins", "Maule", "Nuble", "Biobio", "Araucania"
+  ];
+  const nombreNormalizado = nombreArchivo.toLowerCase();
+  const coincidencia = nombres.find(nombre =>
+    nombreNormalizado.includes(nombre.toLowerCase())
+  );
+
+  if (!coincidencia) return "Region";
+  const etiquetas = {
+    Tarapaca: "Tarapacá",
+    Valparaiso: "Valparaíso",
+    OHiggins: "O'Higgins",
+    Nuble: "Ñuble",
+    Biobio: "Biobío",
+    Araucania: "Araucanía"
+  };
+  return etiquetas[coincidencia] || coincidencia;
+}
+
+function obtenerAnioRepresentativo(pasosTiempo, nombreArchivo) {
+  if (pasosTiempo && pasosTiempo.length > 0) {
+    const coincidenciaTiempo = String(pasosTiempo[0]).match(/(19|20)\d{2}/);
+    if (coincidenciaTiempo) return Number(coincidenciaTiempo[0]);
+  }
+
+  const coincidenciaNombre = String(nombreArchivo || "").match(/(19|20)\d{2}/);
+  return coincidenciaNombre ? Number(coincidenciaNombre[0]) : "No especificado";
+}
+
+function coordenadaDentroDeExtension(longitud, latitud) {
+  const x = state.ncData && state.ncData.x;
+  const y = state.ncData && state.ncData.y;
+  if (!x || !y || x.length === 0 || y.length === 0) return false;
+
+  let minX = x[0];
+  let maxX = x[0];
+  let minY = y[0];
+  let maxY = y[0];
+
+  for (let i = 1; i < x.length; i++) {
+    if (x[i] < minX) minX = x[i];
+    if (x[i] > maxX) maxX = x[i];
+  }
+  for (let j = 1; j < y.length; j++) {
+    if (y[j] < minY) minY = y[j];
+    if (y[j] > maxY) maxY = y[j];
+  }
+
+  return longitud >= minX && longitud <= maxX && latitud >= minY && latitud <= maxY;
+}
+
+function calcularEstadisticasCapa(nombreVariable, usarSuma) {
+  const resultadoVacio = {
+    nValidos: 0,
+    nPositivos: 0,
+    porcentajePositivo: 0,
+    minimoPositivo: null,
+    p25: null,
+    mediana: null,
+    p75: null,
+    p90: null,
+    maximo: null
+  };
+
+  const variable = state.ncData && state.ncData.variables[nombreVariable];
+  const data = variable && variable.data;
+  const x = state.ncData && state.ncData.x;
+  const y = state.ncData && state.ncData.y;
+  if (!data || !x || !y || x.length === 0 || y.length === 0) return resultadoVacio;
+
+  const numeroCeldas = x.length * y.length;
+  const esTresDimensiones = variable.dimensions && variable.dimensions.length === 3;
+  const numeroTiempos = esTresDimensiones
+    ? Math.max(1, Math.floor(data.length / numeroCeldas))
+    : 1;
+  const valoresCapa = [];
+
+  for (let celda = 0; celda < numeroCeldas; celda++) {
+    let acumulado = 0;
+    let validosCelda = 0;
+
+    for (let t = 0; t < numeroTiempos; t++) {
+      const indice = esTresDimensiones ? t * numeroCeldas + celda : celda;
+      const valor = data[indice];
+      if (typeof valor === "number" && Number.isFinite(valor) && valor <= 1e30) {
+        acumulado += valor;
+        validosCelda++;
+      }
+    }
+
+    if (validosCelda > 0) {
+      valoresCapa.push(usarSuma ? acumulado : acumulado / validosCelda);
+    }
+  }
+
+  if (valoresCapa.length === 0) return resultadoVacio;
+
+  valoresCapa.sort((a, b) => a - b);
+  const positivos = valoresCapa.filter(valor => valor > 0);
+  return {
+    nValidos: valoresCapa.length,
+    nPositivos: positivos.length,
+    porcentajePositivo: redondear((positivos.length / valoresCapa.length) * 100, 6),
+    minimoPositivo: positivos.length > 0 ? positivos[0] : null,
+    p25: percentil(valoresCapa, 0.25),
+    mediana: percentil(valoresCapa, 0.50),
+    p75: percentil(valoresCapa, 0.75),
+    p90: percentil(valoresCapa, 0.90),
+    maximo: valoresCapa[valoresCapa.length - 1]
+  };
+}
+
+function percentil(valoresOrdenados, proporcion) {
+  if (!valoresOrdenados || valoresOrdenados.length === 0) return null;
+  const posicion = (valoresOrdenados.length - 1) * proporcion;
+  const inferior = Math.floor(posicion);
+  const superior = Math.ceil(posicion);
+  if (inferior === superior) return valoresOrdenados[inferior];
+  const peso = posicion - inferior;
+  return valoresOrdenados[inferior] * (1 - peso) + valoresOrdenados[superior] * peso;
+}
+
+function redondear(valor, decimales) {
+  if (typeof valor !== "number" || !Number.isFinite(valor)) return null;
+  const factor = 10 ** decimales;
+  return Math.round((valor + Number.EPSILON) * factor) / factor;
+}
+
+function nombreSeguro(texto) {
+  return String(texto || "Region")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function estiloTitulo() {
+  return {
+    font: { bold: true, color: { rgb: "FFFFFF" }, sz: 15 },
+    fill: { fgColor: { rgb: "17365D" } },
+    alignment: { horizontal: "center", vertical: "center" }
+  };
+}
+
+function estiloSeccion() {
+  return {
+    font: { bold: true, color: { rgb: "FFFFFF" } },
+    fill: { fgColor: { rgb: "2F75B5" } },
+    alignment: { horizontal: "left", vertical: "center" }
+  };
+}
+
+function estiloEncabezado() {
+  return {
+    font: { bold: true, color: { rgb: "FFFFFF" } },
+    fill: { fgColor: { rgb: "4472C4" } },
+    alignment: { horizontal: "center", vertical: "center", wrapText: true },
+    border: bordeCompleto()
+  };
+}
+
+function estiloEtiqueta() {
+  return {
+    font: { bold: true },
+    fill: { fgColor: { rgb: "D9EAF7" } },
+    alignment: { vertical: "center", wrapText: true },
+    border: bordeCompleto()
+  };
+}
+
+function bordeCompleto() {
+  const lado = { style: "thin", color: { rgb: "B7C9DA" } };
+  return { top: lado, bottom: lado, left: lado, right: lado };
+}
+
+function aplicarEstiloRango(hoja, rango, estilo) {
+  const limites = XLSX.utils.decode_range(rango);
+  for (let fila = limites.s.r; fila <= limites.e.r; fila++) {
+    for (let columna = limites.s.c; columna <= limites.e.c; columna++) {
+      const direccion = XLSX.utils.encode_cell({ r: fila, c: columna });
+      if (!hoja[direccion]) hoja[direccion] = { t: "s", v: "" };
+      hoja[direccion].s = estilo;
+    }
+  }
+}
+
+function aplicarFormatoNumerico(hoja, columnas, filaInicio, filaFin) {
+  columnas.forEach(columna => {
+    for (let fila = filaInicio; fila <= filaFin; fila++) {
+      const celda = hoja[XLSX.utils.encode_cell({ r: fila, c: columna })];
+      if (celda && celda.t === "n") celda.z = "0.000000";
+    }
+  });
+}
+
+function configurarHojaResumen(hoja) {
+  hoja["!merges"] = [
+    XLSX.utils.decode_range("A1:F1"),
+    XLSX.utils.decode_range("A3:F3"),
+    XLSX.utils.decode_range("A20:F20"),
+    XLSX.utils.decode_range("A29:F29")
+  ];
+  hoja["!cols"] = [
+    { wch: 42 }, { wch: 42 }, { wch: 18 }, { wch: 17 }, { wch: 17 }, { wch: 17 }
+  ];
+  hoja["!rows"] = [{ hpt: 26 }];
+  aplicarEstiloRango(hoja, "A1:F1", estiloTitulo());
+  aplicarEstiloRango(hoja, "A3:F3", estiloSeccion());
+  aplicarEstiloRango(hoja, "A20:F20", estiloSeccion());
+  aplicarEstiloRango(hoja, "A21:C21", estiloEncabezado());
+  aplicarEstiloRango(hoja, "A4:A18", estiloEtiqueta());
+  aplicarEstiloRango(hoja, "A29:F29", {
+    fill: { fgColor: { rgb: "E8F1FA" } },
+    alignment: { vertical: "center", wrapText: true }
+  });
+  aplicarFormatoNumerico(hoja, [1], 3, 26);
+}
+
+function configurarHojaSerie(hoja, numeroFilas) {
+  hoja["!cols"] = [
+    { wch: 12 }, { wch: 17 }, { wch: 15 }, { wch: 18 },
+    { wch: 16 }, { wch: 14 }, { wch: 18 }, { wch: 19 }
+  ];
+  hoja["!autofilter"] = { ref: `A1:H${numeroFilas}` };
+  aplicarEstiloRango(hoja, "A1:H1", estiloEncabezado());
+  aplicarFormatoNumerico(hoja, [3, 6, 7], 1, numeroFilas - 1);
+}
+
+function configurarHojaEstadisticas(hoja, numeroFilas) {
+  hoja["!cols"] = [{ wch: 34 }, { wch: 20 }, { wch: 18 }];
+  hoja["!autofilter"] = { ref: `A1:C${numeroFilas}` };
+  aplicarEstiloRango(hoja, "A1:C1", estiloEncabezado());
+  aplicarFormatoNumerico(hoja, [1], 1, numeroFilas - 1);
+}
+
+function configurarHojaMetadatos(hoja, numeroFilas) {
+  hoja["!cols"] = [{ wch: 38 }, { wch: 85 }];
+  aplicarEstiloRango(hoja, "A1:B1", estiloEncabezado());
+  aplicarEstiloRango(hoja, `A2:A${numeroFilas}`, estiloEtiqueta());
+  aplicarFormatoNumerico(hoja, [1], 1, numeroFilas - 1);
 }
