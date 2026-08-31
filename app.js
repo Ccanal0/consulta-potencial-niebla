@@ -1,6 +1,7 @@
 /**
  * Explorador Espacial NetCDF AMARU
  * Motor Universal WebAssembly HDF5 / NetCDF4 y NetCDF3 (Frontend en Español)
+ * Versión: CELDAS-EXACTAS-2026-08-31 — mapa reproyectado, ceros transparentes.
  */
 
 // Registrar Proyecciones Proj4
@@ -21,7 +22,9 @@ const state = {
   ncData: null,
   extractedTimeSeries: null,
   ncCache: new Map(),
-  h5wasmReady: false
+  h5wasmReady: false,
+  isLoading: false,
+  requestedFilename: null
 };
 
 // Elementos del DOM
@@ -48,6 +51,12 @@ let ncOverlayLayer = null;
 let ncLegendControl = null;
 let selectedCellLayer = null;
 let coordinateInputTimer = null;
+let loadSequence = 0;
+let lastFittedDataset = null;
+const gridGeometryCache = new WeakMap();
+const variableReaderCache = new WeakMap();
+const layerSummaryCache = new WeakMap();
+const APP_VERSION = "CELDAS-EXACTAS-2026-08-31";
 
 function createMapMarkerIcon(color = "#38bdf8", label = "") {
   return L.divIcon({
@@ -121,7 +130,10 @@ async function initH5Wasm() {
 }
 
 function initMap() {
-  map = L.map("map", { center: [-30.0, -71.0], zoom: 6 });
+  map = L.map("map", { center: [-30.0, -71.0], zoom: 6, maxZoom: 19 });
+  map.createPane("amaruLabels");
+  map.getPane("amaruLabels").style.zIndex = 450;
+  map.getPane("amaruLabels").style.pointerEvents = "none";
 
   // Atenuar el verde y el azul del fondo satelital permite que la capa de
   // niebla cálida se distinga con claridad. La alternativa de color original
@@ -171,7 +183,7 @@ function initMap() {
     labelsUrl,
     {
       maxZoom: 19,
-      attribution: "Labels © Esri"
+      attribution: "Labels © Esri", pane: "amaruLabels"
     }
   );
 
@@ -189,7 +201,7 @@ function initMap() {
     labelsUrl,
     {
       maxZoom: 19,
-      attribution: "Labels © Esri"
+      attribution: "Labels © Esri", pane: "amaruLabels"
     }
   );
 
@@ -275,11 +287,15 @@ function setupEventListeners() {
   });
 
   btnExtract.addEventListener("click", () => {
-    queryAndPlot();
+    window.clearTimeout(coordinateInputTimer);
+    updateCoordsFromInputs();
   });
 
+  btnExportExcel.disabled = true;
   btnExportExcel.addEventListener("click", () => {
-    exportToExcel();
+    window.clearTimeout(coordinateInputTimer);
+    updateCoordsFromInputs();
+    if (!state.isLoading && state.extractedTimeSeries) exportToExcel();
   });
 
   varSelect.addEventListener("change", () => {
@@ -329,7 +345,7 @@ function drawCatalogPolygonsOnMap() {
     const bounds = [[item.min_lat, item.min_lon], [item.max_lat, item.max_lon]];
 
     const poly = L.rectangle(bounds, {
-      color: "#38bdf8", weight: 1, fillColor: "#38bdf8", fillOpacity: 0.08
+      color: "#64748b", weight: 1, fill: false
     }).addTo(regionPolygonsGroup);
 
     poly.bindTooltip(item.filename.replace('_compressed.nc', ''), { permanent: false, direction: "center" });
@@ -364,66 +380,46 @@ function autoDetectAndLoadRegion() {
  * Carga de NetCDF a través de HTTP y Parser Universal
  */
 async function fetchAndLoadNetCDF(filename) {
-  if (state.activeFilename === filename && state.ncData && !state.ncData.isIndexedFallback) {
-    queryAndPlot();
-    return;
+  if (state.isLoading && state.requestedFilename === filename) return;
+  if (!state.isLoading && state.activeFilename === filename && state.ncData && !state.ncData.isIndexedFallback) {
+    queryAndPlot(); return;
   }
-
-  statusText.textContent = `Cargando ${filename}...`;
-
-  // Esperar a que el motor WASM se inicialice si la red está lenta (ej: GitHub Pages)
-  await waitForH5Wasm(12000);
-
+  const request = ++loadSequence;
+  state.requestedFilename = filename; state.isLoading = true;
+  state.ncData = null;
+  lastFittedDataset = null;
+  clearCurrentQuery("Cargando " + filename + "...");
+  removeFogOverlay();
+  btnExtract.disabled = true; varSelect.disabled = true;
+  loadedFileInfo.style.display = "none";
   try {
-    let buffer;
-    if (state.ncCache.has(filename)) {
-      buffer = state.ncCache.get(filename);
-    } else {
-      const res = await fetch(`data/${filename}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      buffer = await res.arrayBuffer();
+    await waitForH5Wasm(12000);
+    if (request !== loadSequence) return;
+    let buffer = state.ncCache.get(filename);
+    if (!buffer) {
+      const response = await fetch("data/" + filename);
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      buffer = await response.arrayBuffer();
+      if (request !== loadSequence) return;
       state.ncCache.set(filename, buffer);
+      while (state.ncCache.size > 2) state.ncCache.delete(state.ncCache.keys().next().value);
     }
-
     const parsed = await parseUniversalNetCDF(buffer, filename);
-    state.activeFilename = filename;
-    state.ncData = parsed;
-
-    fileNameDisplay.textContent = filename;
-    loadedFileInfo.style.display = "block";
-    statusText.textContent = `Cargado ${filename}`;
-
-    populateVariableSelect();
-    queryAndPlot();
-    drawNetCDFOverlay();
-  } catch (err) {
-    console.error("Fallo al procesar NetCDF:", err);
-    
-    // Respaldo mediante índice espacial regional
-    if (state.regionalIndex && state.regionalIndex[filename]) {
-      console.log("Usando respaldo indexado para:", filename);
-      const idxEntry = state.regionalIndex[filename];
-      state.activeFilename = filename;
-      state.ncData = {
-        dimensions: { y: idxEntry.y.length, x: idxEntry.x.length, time: idxEntry.time.length },
-        variables: idxEntry.variables,
-        x: idxEntry.x,
-        y: idxEntry.y,
-        time: idxEntry.time,
-        isIndexedFallback: true
-      };
-
-      fileNameDisplay.textContent = `${filename} (Indexado)`;
-      loadedFileInfo.style.display = "block";
-      statusText.textContent = `Cargado ${filename} (Indexado)`;
-
-      populateVariableSelect();
-      queryAndPlot();
-      drawNetCDFOverlay();
-    } else {
-      statusText.textContent = `Error al cargar ${filename}`;
-      alert(`No se pudo cargar ${filename}. Asegúrate de que el navegador soporte ArrayBuffer.`);
-    }
+    if (request !== loadSequence) return;
+    // Comprobar antes de publicar un dataset nuevo en el estado de la pantalla.
+    getGridGeometry(parsed);
+    for (const name of getDataVariableNames(parsed)) getVariableReader(parsed, name);
+    state.ncData = parsed; state.activeFilename = filename; state.isLoading = false;
+    fileNameDisplay.textContent = filename; loadedFileInfo.style.display = "block";
+    btnExtract.disabled = false; varSelect.disabled = false;
+    populateVariableSelect(); queryAndPlot(); drawNetCDFOverlay();
+  } catch (error) {
+    if (request !== loadSequence) return;
+    console.error("Fallo al procesar NetCDF:", error);
+    state.isLoading = false; state.ncData = null;
+    btnExtract.disabled = false; varSelect.disabled = false;
+    clearCurrentQuery("No se pudo cargar " + filename + ": " + error.message);
+    // Un índice sin valores originales no debe producir falsos ceros.
   }
 }
 
@@ -444,26 +440,26 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
       let xArr = null, yArr = null, timeArr = null;
 
       function readAttrs(item) {
-        const attrs = {};
-        try {
-          if (item && item.attrs) {
-            for (const aKey of item.attrs.keys()) {
-              try {
-                let attrObj = item.attrs.get(aKey);
-                let val = attrObj ? attrObj.value : null;
-                if (val instanceof Uint8Array || val instanceof Int8Array || val instanceof Uint8ClampedArray) {
-                  val = new TextDecoder().decode(val).replace(/\0/g, "").trim();
-                } else if (Array.isArray(val)) {
-                  val = val.map(v => (v instanceof Uint8Array) ? new TextDecoder().decode(v) : (typeof v === "number" ? String.fromCharCode(v) : String(v))).join("").replace(/\0/g, "").trim();
-                } else if (typeof val === "string") {
-                  val = val.replace(/\0/g, "").trim();
-                }
-                attrs[aKey] = val;
-              } catch (_) {}
+        const result = {}, source = item?.attrs;
+        if (!source) return result;
+        const names = typeof source.keys === "function" ? Array.from(source.keys()) : Object.keys(source);
+        for (const name of names) {
+          try {
+            const attribute = typeof source.get === "function" ? source.get(name) : source[name];
+            let value = attribute?.value;
+            if (typeof value === "string") value = value.replace(/\0/g, "").trim();
+            else if (ArrayBuffer.isView(value) || Array.isArray(value)) {
+              // Los metadatos numéricos (FillValue, scale_factor...) no son texto.
+              const textAttribute = ["units", "calendar", "calendar_type", "long_name", "standard_name"].includes(name);
+              value = textAttribute && value instanceof Uint8Array
+                ? new TextDecoder().decode(value).replace(/\0/g, "").trim()
+                : Array.from(value);
+              if (Array.isArray(value) && value.length === 1) value = value[0];
             }
-          }
-        } catch (_) {}
-        return attrs;
+            result[name] = value;
+          } catch (_) {}
+        }
+        return result;
       }
 
       // CRITICAL: item.value is backed by WASM heap memory.
@@ -543,7 +539,7 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
             const data = copyToJS(rawData);   // copy before file.close()!
             const attrs = readAttrs(item);
             const shapeStr = (item.shape || []).join("x");
-            vars[key] = { name: key, dimensions: item.shape, data: data, units: attrs.units || "", attributes: attrs };
+            vars[key] = { name: key, shape: Array.from(item.shape || []), dimensions: item.shape, data: data, units: attrs.units || "", attributes: attrs };
             console.log("h5wasm " + key + " [" + shapeStr + "] len=" + (data ? data.length : "null") + " units=" + (attrs.units || ""));
 
             const kLower = key.toLowerCase();
@@ -561,6 +557,7 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
 
       inspectGroup(file);
       file.close();
+      FS.unlink(safeName); // liberar la copia comprimida alojada en WASM
 
       console.log("h5wasm parsed " + filename + ": x=" + (xArr ? xArr.length : "null") + ", y=" + (yArr ? yArr.length : "null") + ", vars=" + Object.keys(vars).join(","));
 
@@ -588,6 +585,7 @@ async function parseUniversalNetCDF(arrayBuffer, filename = "archivo.nc") {
       vars[v.name] = {
         name: v.name,
         dimensions: v.dimensions,
+        shape: v.dimensions.map(id => ncReader.dimensions[id].size),
         data: data,
         attributes: v.attributes
       };
@@ -633,7 +631,9 @@ function updateCoordsFromInputs() {
   const x = parseFloat(eastingInput.value);
   const y = parseFloat(northingInput.value);
 
-  if (isNaN(x) || isNaN(y)) return;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    clearCurrentQuery("Completa ambas coordenadas con números válidos."); return;
+  }
 
   state.easting = x;
   state.northing = y;
@@ -646,9 +646,12 @@ function updateCoordsFromInputs() {
       const geo = proj4(state.selectedCrs, "EPSG:4326", [x, y]);
       state.lon = geo[0];
       state.lat = geo[1];
-    } catch (e) {}
+    } catch (e) { clearCurrentQuery("No se pudieron transformar las coordenadas."); return; }
   }
 
+  if (!Number.isFinite(state.lat) || !Number.isFinite(state.lon) || Math.abs(state.lat) > 85 || Math.abs(state.lon) > 180) {
+    clearCurrentQuery("Las coordenadas no corresponden a una ubicación válida."); return;
+  }
   const latLng = L.latLng(state.lat, state.lon);
   marker.setLatLng(latLng);
   map.panTo(latLng);
@@ -661,129 +664,243 @@ function updateCoordsFromInputs() {
 }
 
 function populateVariableSelect() {
-  varSelect.innerHTML = `<option value="all">Todas las Variables</option>`;
-  if (!state.ncData) return;
+  const previous = varSelect.value;
+  varSelect.innerHTML = '<option value="all">Todas las Variables</option>';
+  for (const name of getDataVariableNames()) {
+    const option = document.createElement("option");
+    option.value = name; option.textContent = name; varSelect.appendChild(option);
+  }
+  varSelect.value = getDataVariableNames().includes(previous) ? previous : "all";
+}
 
-  Object.keys(state.ncData.variables).forEach((varName) => {
-    if (!["x", "y", "lat", "lon", "time", "datetime"].includes(varName.toLowerCase())) {
-      const opt = document.createElement("option");
-      opt.value = varName;
-      opt.textContent = varName;
-      varSelect.appendChild(opt);
+// Todos los consumidores usan los mismos índices y valores originales.
+// Los cachés pertenecen al dataset; al cambiar de archivo pueden liberarse.
+function getDataVariableNames(nc = state.ncData) {
+  if (!nc || !nc.variables) return [];
+  const coordinates = new Set(["x", "y", "lat", "lon", "latitude", "longitude",
+    "easting", "northing", "time", "datetime", "date", "crs", "spatial_ref"]);
+  return Object.keys(nc.variables).filter(name => !coordinates.has(name.toLowerCase())
+    && nc.variables[name].dimensions?.length >= 2);
+}
+
+function buildAxisInfo(values) {
+  if (!values || !values.length) throw new Error("Falta un eje espacial del NetCDF.");
+  const n = values.length, first = Number(values[0]);
+  const step = n > 1 ? Number(values[1]) - first : 0.0001;
+  if (!Number.isFinite(first) || !Number.isFinite(step) || step === 0)
+    throw new Error("El eje espacial contiene coordenadas inválidas.");
+  let regular = true;
+  for (let k = 1; k < n; k++) {
+    const delta = Number(values[k]) - Number(values[k - 1]);
+    if (!Number.isFinite(delta) || delta * step <= 0)
+      throw new Error("Las coordenadas del NetCDF deben ser monótonas.");
+    if (Math.abs(delta - step) > Math.abs(step) * 1e-6) regular = false;
+  }
+  const bounds = getGridExtentEdges(values);
+  return { values, n, first, step, regular, ascending: step > 0,
+    min: bounds[0], max: bounds[1] };
+}
+
+function nearestAxisIndex(axis, coordinate) {
+  if (!Number.isFinite(coordinate) || coordinate < axis.min || coordinate > axis.max) return -1;
+  if (axis.n === 1) return 0;
+  let low, high;
+  if (axis.regular) {
+    low = Math.max(0, Math.min(axis.n - 1, Math.floor((coordinate - axis.first) / axis.step)));
+    high = Math.min(axis.n - 1, low + 1);
+  } else {
+    low = 0; high = axis.n - 1;
+    while (high - low > 1) {
+      const middle = (low + high) >> 1;
+      if ((coordinate > axis.values[middle]) === axis.ascending) low = middle;
+      else high = middle;
     }
-  });
+  }
+  // En un empate se mantiene el primer índice, igual que en la consulta original.
+  return Math.abs(coordinate - axis.values[low]) <= Math.abs(coordinate - axis.values[high])
+    ? low : high;
+}
+
+function getGridGeometry(nc = state.ncData) {
+  if (!nc) throw new Error("Todavía no hay un NetCDF cargado.");
+  if (gridGeometryCache.has(nc)) return gridGeometryCache.get(nc);
+  const x = buildAxisInfo(nc.x), y = buildAxisInfo(nc.y);
+  // Los NetCDF regionales AMARU usan lon/lat. No se adivina un CRS para
+  // archivos proyectados, porque hacerlo podría dibujar datos en otro lugar.
+  if (x.min < -180 || x.max > 180 || y.min < -85.051129 || y.max > 85.051129)
+    throw new Error("Este visor requiere la malla AMARU en longitud/latitud.");
+  const geometry = { x, y, width: x.n, height: y.n, size: x.n * y.n,
+    bounds: [[y.min, x.min], [y.max, x.max]] };
+  gridGeometryCache.set(nc, geometry);
+  return geometry;
+}
+
+function numericAttribute(attributes, name, fallback) {
+  const found = Array.isArray(attributes)
+    ? attributes.find(item => item.name === name)?.value : attributes?.[name];
+  const value = ArrayBuffer.isView(found) || Array.isArray(found) ? found[0] : found;
+  if (value === undefined || value === null || value === "") return fallback;
+  return Number(value);
+}
+
+function getVariableReader(nc, name) {
+  let cached = variableReaderCache.get(nc);
+  if (!cached) { cached = new Map(); variableReaderCache.set(nc, cached); }
+  if (cached.has(name)) return cached.get(name);
+  const variable = nc.variables[name], geometry = getGridGeometry(nc);
+  if (!variable?.data || nc.isIndexedFallback)
+    throw new Error("Se necesita el NetCDF completo para consultar valores originales.");
+  const data = variable.data, rank = variable.dimensions?.length;
+  const steps = rank === 3 ? data.length / geometry.size : 1;
+  if ((rank !== 2 && rank !== 3) || !Number.isInteger(steps) || steps < 1 ||
+      data.length !== steps * geometry.size)
+    throw new Error("La forma de la variable " + name + " no coincide con la malla.");
+  if (variable.shape && (variable.shape[rank - 1] !== geometry.width ||
+      variable.shape[rank - 2] !== geometry.height))
+    throw new Error("Orden espacial no compatible en " + name + ": se espera tiempo, latitud, longitud.");
+  const fill = numericAttribute(variable.attributes, "_FillValue", NaN);
+  const missing = numericAttribute(variable.attributes, "missing_value", NaN);
+  const scale = numericAttribute(variable.attributes, "scale_factor", 1);
+  const offset = numericAttribute(variable.attributes, "add_offset", 0);
+  const isFiniteNumber = Number.isFinite, absolute = Math.abs;
+  const stride = rank === 3 ? geometry.size : 0;
+  const reader = {
+    steps, size: geometry.size, units: String(variable.units || variable.attributes?.units || ""),
+    read(t, cell) {
+      const raw = data[t * stride + cell];
+      if (typeof raw !== "number" || !isFiniteNumber(raw) || absolute(raw) > 1e30 ||
+          raw === fill || raw === missing) return null;
+      const value = raw * scale + offset;
+      // Wh y LWC no admiten valores físicos negativos.
+      return isFiniteNumber(value) && value >= 0 ? value : null;
+    }
+  };
+  cached.set(name, reader);
+  return reader;
+}
+
+function aggregateMonthlyValues(values, variable) {
+  let sum = 0, count = 0;
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      sum += value; count++;
+    }
+  }
+  return { value: count ? (variable.toLowerCase() === "wh" ? sum : sum / count) : null,
+    count };
+}
+
+function getLayerSummary(nc, name) {
+  let cached = layerSummaryCache.get(nc);
+  if (!cached) { cached = new Map(); layerSummaryCache.set(nc, cached); }
+  if (cached.has(name)) return cached.get(name);
+  const geometry = getGridGeometry(nc), reader = getVariableReader(nc, name);
+  const values = new Float64Array(geometry.size), counts = new Uint32Array(geometry.size);
+  // Recorrido secuencial de memoria; se calcula una sola vez por variable.
+  const read = reader.read;
+  for (let t = 0; t < reader.steps; t++) {
+    for (let cell = 0; cell < geometry.size; cell++) {
+      const value = read(t, cell);
+      if (value !== null) { values[cell] += value; counts[cell]++; }
+    }
+  }
+  const useSum = name.toLowerCase() === "wh";
+  let valid = 0, positive = 0;
+  for (let cell = 0; cell < values.length; cell++) {
+    if (!counts[cell]) { values[cell] = NaN; continue; }
+    if (!useSum) values[cell] /= counts[cell];
+    valid++;
+    if (values[cell] > 0) positive++;
+  }
+  const positiveValues = new Float64Array(positive);
+  for (let cell = 0, k = 0; cell < values.length; cell++)
+    if (values[cell] > 0) positiveValues[k++] = values[cell];
+  positiveValues.sort();
+  const zeros = valid - positive;
+  const quantile = proportion => {
+    if (!valid) return null;
+    const index = (valid - 1) * proportion, lo = Math.floor(index), hi = Math.ceil(index);
+    const at = i => i < zeros ? 0 : positiveValues[i - zeros];
+    return at(lo) * (1 - (index - lo)) + at(hi) * (index - lo);
+  };
+  const summary = { geometry, values, name, steps: reader.steps, useSum,
+    units: reader.units, displayMax: positiveValues[Math.floor((positive - 1) * 0.98)] || 0,
+    statistics: { nValidos: valid, nPositivos: positive,
+      porcentajePositivo: valid ? redondear(positive / valid * 100, 6) : 0,
+      minimoPositivo: positive ? positiveValues[0] : null,
+      p25: quantile(0.25), mediana: quantile(0.5), p75: quantile(0.75),
+      p90: quantile(0.9), maximo: valid ? (positive ? positiveValues[positive - 1] : 0) : null } };
+  cached.set(name, summary);
+  return summary;
+}
+
+function formatFogValue(value) {
+  if (value === null || !Number.isFinite(value)) return "Sin dato";
+  if (value > 0 && value < 0.0001) return value.toExponential(3);
+  return value.toLocaleString("es-CL", { maximumFractionDigits: 4 });
+}
+
+function getTimeLabels(nc, count) {
+  if (nc.time?.length === count && nc.time.some(value => isNaN(Number(value))))
+    return Array.from(nc.time);
+  const catalogEntry = state.catalog.find(item => item.filename === state.activeFilename);
+  if (catalogEntry?.sample_times?.length === count) return [...catalogEntry.sample_times];
+  // No inventar meses/años si faltan los metadatos temporales.
+  return Array.from({ length: count }, (_, i) => "Paso " + (i + 1));
+}
+
+function clearCurrentQuery(message) {
+  state.extractedTimeSeries = null;
+  btnExportExcel.disabled = true;
+  if (selectedCellLayer) { map.removeLayer(selectedCellLayer); selectedCellLayer = null; }
+  if (marker) { marker.unbindTooltip(); marker.setIcon(createMapMarkerIcon("#64748b", "?")); }
+  if (typeof Plotly !== "undefined") Plotly.purge(document.getElementById("plot-container"));
+  metaGrid.textContent = "-"; metaNearestCoords.textContent = "-"; metaTimeCount.textContent = "-";
+  statusText.textContent = message;
 }
 
 function queryAndPlot() {
-  if (!state.ncData) {
-    statusText.textContent = "Esperando la carga del archivo NetCDF...";
-    return;
-  }
-
-  const targetX = state.easting;
-  const targetY = state.northing;
-  const xArr = state.ncData.x;
-  const yArr = state.ncData.y;
-
-  if (!xArr || !yArr) return;
-
-  let nearestI = 0, nearestJ = 0;
-
-  // Usar loop en vez de spread para evitar stack overflow en arrays grandes
-  let xMin = xArr[0], xMax = xArr[0];
-  for (let k = 1; k < xArr.length; k++) { if (xArr[k] < xMin) xMin = xArr[k]; if (xArr[k] > xMax) xMax = xArr[k]; }
-  const isNcLatLon = xMax <= 180 && xMin >= -180;
-  const queryX = isNcLatLon ? state.lon : targetX;
-  const queryY = isNcLatLon ? state.lat : targetY;
-
-  // Lightweight debug: shows clicked coords and found grid indices
-  console.log("query: lat="+queryY.toFixed(4)+" lon="+queryX.toFixed(4)+" → nearestJ=" + 0 + " nearestI=" + 0 + " (computing...)");
-
-  for (let i = 0; i < xArr.length; i++) {
-    if (Math.abs(xArr[i] - queryX) < Math.abs(xArr[nearestI] - queryX)) nearestI = i;
-  }
-
-  for (let j = 0; j < yArr.length; j++) {
-    if (Math.abs(yArr[j] - queryY) < Math.abs(yArr[nearestJ] - queryY)) nearestJ = j;
-  }
-
-  const numY = yArr.length;
-  const numX = xArr.length;
-
-  let timeSteps = state.ncData.time;
-
-  // Guarantee dates are formatted ISO strings (e.g. 2023-01-01) instead of raw day offsets (0..365)
-  if (!timeSteps || timeSteps.length === 0 || timeSteps.every(t => !isNaN(Number(t)))) {
-    const catItem = state.catalog.find(c => c.filename === state.activeFilename);
-    if (catItem && catItem.sample_times && catItem.sample_times.length > 0) {
-      timeSteps = catItem.sample_times;
-    } else {
-      timeSteps = Array.from({ length: 12 }, (_, i) => `2023-${String(i + 1).padStart(2, '0')}-01`);
+  if (state.isLoading) return;
+  if (!state.ncData) { clearCurrentQuery("Esperando la carga del archivo NetCDF..."); return; }
+  try {
+    const geometry = getGridGeometry(), nc = state.ncData;
+    const activeI = nearestAxisIndex(geometry.x, state.lon);
+    const activeJ = nearestAxisIndex(geometry.y, state.lat);
+    if (activeI < 0 || activeJ < 0) {
+      clearCurrentQuery("La coordenada está fuera de la malla del archivo seleccionado.");
+      return;
     }
-  }
-
-  const varKeys = Object.keys(state.ncData.variables).filter(
-    k => !["x", "y", "lat", "lon", "time", "datetime"].includes(k.toLowerCase())
-  );
-
-  // Consulta estricta: se usa exclusivamente la celda original de la malla
-  // más cercana a la coordenada ingresada. Si esa celda contiene cero o no
-  // tiene niebla, se informa ese resultado sin buscar celdas positivas vecinas.
-  const activeJ = nearestJ;
-  const activeI = nearestI;
-  const snappedToFog = false;
-  const snapDistanceKm = 0;
-
-  const nearestGridX = xArr[activeI];
-  const nearestGridY = yArr[activeJ];
-
-  const extracted = {};
-
-  varKeys.forEach((varName) => {
-    const vObj = state.ncData.variables[varName];
-    const data = vObj.data;
-    const values = [];
-
-    for (let t = 0; t < timeSteps.length; t++) {
-      let val = null;
-      if (data) {
-        if (vObj.dimensions && vObj.dimensions.length === 3) {
-          const idx = t * (numY * numX) + activeJ * numX + activeI;
-          const raw = data[idx];
-          if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
-        } else if (vObj.dimensions && vObj.dimensions.length === 2) {
-          const idx = activeJ * numX + activeI;
-          const raw = data[idx];
-          if (raw !== undefined && !isNaN(raw) && raw <= 1e30) val = raw;
-        } else if (data[t] !== undefined && !isNaN(data[t]) && data[t] <= 1e30) {
-          val = data[t];
-        }
-      }
-
-      values.push(val !== null ? parseFloat(val.toFixed(6)) : null);
+    const names = getDataVariableNames(), extracted = {};
+    if (!names.length) throw new Error("No hay variables espaciales disponibles.");
+    const steps = getVariableReader(nc, names[0]).steps;
+    const timeSteps = getTimeLabels(nc, steps), cell = activeJ * geometry.width + activeI;
+    for (const name of names) {
+      const reader = getVariableReader(nc, name);
+      if (reader.steps !== steps) throw new Error("Las variables tienen distintos períodos.");
+      const values = Array.from({ length: steps }, (_, t) => reader.read(t, cell));
+      // Se conserva la precisión del dato; el formato visual no cambia los valores.
+      extracted[name] = { values, units: reader.units };
     }
-
-    extracted[varName] = { values: values, units: vObj.units || vObj.attributes?.units || "" };
-  });
-
-  state.extractedTimeSeries = {
-    targetX, targetY, nearestI, nearestJ, activeI, activeJ, nearestGridX, nearestGridY, snappedToFog, snapDistanceKm, timeSteps, extracted
-  };
-
-  updateMetadataUI();
-  renderPlot();
-  const selectedCellInfo = drawSelectedGridCell();
-  const valueText = selectedCellInfo
-    ? ` · ${selectedCellInfo.variable}: ${selectedCellInfo.formattedValue}`
-    : "";
-  statusText.textContent = `Consulta actualizada: Lat ${state.lat.toFixed(4)}, Lon ${state.lon.toFixed(4)}${valueText}`;
+    state.extractedTimeSeries = {
+      targetX: state.easting, targetY: state.northing,
+      nearestI: activeI, nearestJ: activeJ, activeI, activeJ,
+      nearestGridX: nc.x[activeI], nearestGridY: nc.y[activeJ],
+      snappedToFog: false, snapDistanceKm: 0, timeSteps, extracted
+    };
+    btnExportExcel.disabled = false;
+    updateMetadataUI(); renderPlot();
+    const selected = drawSelectedGridCell();
+    statusText.textContent = "Consulta actualizada: Lat " + state.lat.toFixed(4) +
+      ", Lon " + state.lon.toFixed(4) + (selected ? " · " + selected.variable + ": " + selected.formattedValue : "");
+  } catch (error) {
+    console.error(error);
+    clearCurrentQuery("No se puede consultar: " + error.message);
+  }
 }
 
 function getMapVariableName() {
   if (!state.ncData || !state.ncData.variables) return null;
-  const varNames = Object.keys(state.ncData.variables).filter(
-    name => !["x", "y", "lat", "lon", "time", "datetime"].includes(name.toLowerCase())
-  );
+  const varNames = getDataVariableNames();
   if (!varNames.length) return null;
 
   const selectedVar = varSelect ? varSelect.value : "all";
@@ -830,75 +947,34 @@ function getGridExtentEdges(values) {
 
 function drawSelectedGridCell() {
   if (!map || !state.ncData || !state.extractedTimeSeries) return null;
-
-  if (selectedCellLayer) {
-    map.removeLayer(selectedCellLayer);
-    selectedCellLayer = null;
-  }
-
-  const ext = state.extractedTimeSeries;
+  if (selectedCellLayer) { map.removeLayer(selectedCellLayer); selectedCellLayer = null; }
+  const ext = state.extractedTimeSeries, variable = getMapVariableName();
+  const series = ext.extracted[variable];
+  if (!series) return null;
   const xEdges = getGridCellEdges(state.ncData.x, ext.activeI);
   const yEdges = getGridCellEdges(state.ncData.y, ext.activeJ);
-  const variable = getMapVariableName();
-  const variableData = variable ? ext.extracted[variable] : null;
-  if (!xEdges || !yEdges || !variableData) return null;
-
-  const validValues = variableData.values.filter(
-    value => typeof value === "number" && Number.isFinite(value)
-  );
-  const annualValue = validValues.reduce((sum, value) => sum + value, 0);
-  const hasPositiveValue = annualValue > 0;
-  const formattedValue = Number.isFinite(annualValue)
-    ? annualValue.toLocaleString("es-CL", { maximumFractionDigits: 4 })
-    : "sin dato";
-  const units = variableData.units ? ` ${variableData.units}` : "";
-  const outlineColor = hasPositiveValue ? "#ffffff" : "#ff3b30";
-
-  const cellRectangle = L.rectangle(
-    [[yEdges[0], xEdges[0]], [yEdges[1], xEdges[1]]],
-    {
-      pane: "selectedCellPane",
-      color: outlineColor,
-      weight: 3,
-      opacity: 1,
-      dashArray: hasPositiveValue ? null : "6 4",
-      fillColor: hasPositiveValue ? "#ffffff" : "#0f172a",
-      fillOpacity: hasPositiveValue ? 0.04 : 0.72,
-      interactive: false
-    }
-  );
-
-  const selectedLayers = [cellRectangle];
-
-  // Una celda puede ser menor que un píxel de pantalla cuando se visualiza
-  // toda la región. En ese caso su transparencia no alcanza a percibirse.
-  // Esta máscara circular, de tamaño constante en pantalla, elimina cualquier
-  // color bajo el punto exacto cuando el valor consultado es cero.
-  if (!hasPositiveValue) {
-    selectedLayers.push(L.circleMarker([state.lat, state.lon], {
-      pane: "selectedCellPane",
-      radius: 25,
-      color: "#ff3b30",
-      weight: 4,
-      opacity: 1,
-      fillColor: "#0f172a",
-      fillOpacity: 0.98,
-      interactive: false
-    }));
-  }
-
-  selectedCellLayer = L.layerGroup(selectedLayers).addTo(map);
-
-  marker.setIcon(createMapMarkerIcon(hasPositiveValue ? "#22c55e" : "#ef4444", hasPositiveValue ? "✓" : "0"));
+  const aggregate = aggregateMonthlyValues(series.values, variable);
+  const value = aggregate.value, positive = value !== null && value > 0;
+  const color = value === null ? "#94a3b8" : positive ? "#ffffff" : "#94a3b8";
+  // Solo contorno: nunca se tapa el mapa con una máscara alrededor del clic.
+  selectedCellLayer = L.rectangle([[yEdges[0], xEdges[0]], [yEdges[1], xEdges[1]]], {
+    pane: "selectedCellPane", color, weight: 2, opacity: 0.95, fill: false,
+    dashArray: positive ? null : "4 4", interactive: false
+  }).addTo(map);
+  marker.setIcon(createMapMarkerIcon(positive ? "#22c55e" : "#64748b",
+    value === null ? "?" : positive ? "✓" : "0"));
+  const period = variable.toLowerCase() === "wh" ? "Suma del período" : "Promedio del período";
+  const units = series.units ? " " + series.units : "";
+  const formattedValue = formatFogValue(value);
   marker.unbindTooltip();
   marker.bindTooltip(
-    `<b>Celda exacta consultada</b><br>${variable} Σ anual: ${formattedValue}${units}<br>` +
-    `i=${ext.activeI}, j=${ext.activeJ}`,
+    "<b>Celda original consultada</b><br>" + variable + " · " + period + ": " +
+    formattedValue + (value === null ? "" : units) + "<br>" +
+    aggregate.count + "/" + series.values.length + " meses válidos<br>" +
+    "i=" + ext.activeI + ", j=" + ext.activeJ,
     { direction: "top", offset: [0, -14], className: "amaru-cell-tooltip", opacity: 1 }
   );
-  if (!hasPositiveValue) marker.openTooltip();
-
-  return { variable, annualValue, formattedValue: `${formattedValue}${units}` };
+  return { variable, annualValue: value, formattedValue: formattedValue + (value === null ? "" : units) };
 }
 
 function updateMetadataUI() {
@@ -912,7 +988,7 @@ function updateMetadataUI() {
     } else {
       metaGrid.textContent = `(i: ${ext.nearestI}, j: ${ext.nearestJ})`;
     }
-    metaNearestCoords.textContent = `${ext.nearestGridX.toFixed(2)}, ${ext.nearestGridY.toFixed(2)}`;
+    metaNearestCoords.textContent = `${ext.nearestGridX.toFixed(6)}, ${ext.nearestGridY.toFixed(6)}`;
     metaTimeCount.textContent = `${ext.timeSteps.length} pasos`;
   }
 }
@@ -969,7 +1045,7 @@ function renderPlot() {
       hovertemplate:
         `<b>${varName}</b><br>` +
         `Fecha: %{customdata}<br>` +
-        `Valor: %{y:.4f}${vData.units ? " " + vData.units : ""}<extra></extra>`
+        `Valor: %{y:.6~g}${vData.units ? " " + vData.units : ""}<extra></extra>`
     });
     colorIdx++;
   });
@@ -981,7 +1057,7 @@ function renderPlot() {
   const emptyMessage = !hasAnyValidValue
     ? "No hay datos legibles en la celda original seleccionada"
     : !hasAnyPositiveValue
-      ? "Celda original válida: valor 0 durante todos los meses (sin niebla registrada)"
+      ? "Los valores válidos de esta celda son cero en el modelo AMARU"
       : null;
 
   const annotations = emptyMessage ? [{
@@ -1017,7 +1093,7 @@ function renderPlot() {
     zerolinecolor: "rgba(226,232,240,0.55)",
     zerolinewidth: 1,
     tickfont: { color: "#cbd5e1", size: 12 },
-    tickformat: ".3~f",
+    tickformat: ".4~g",
     automargin: true,
     rangemode: "tozero",
     fixedrange: false
@@ -1111,211 +1187,166 @@ function renderPlot() {
 }
 
 /**
- * Renderiza capa ráster del NetCDF activo sobre el mapa Leaflet.
- * Calcula la suma espacial sobre todos los pasos de tiempo y la dibuja
- * en un canvas HTML, luego lo superpone como ImageOverlay.
+ * Ráster en teselas Web Mercator. Cada píxel se transforma a lon/lat y se
+ * consulta en la malla original. NO se estira una imagen geográfica entre
+ * cuatro esquinas ni se aplica interpolación bilineal.
  */
-function drawNetCDFOverlay() {
-  if (!state.ncData) return;
+function fogColor(value, maximum) {
+  if (!Number.isFinite(value) || value <= 0 || !(maximum > 0)) return [0, 0, 0, 0];
+  const norm = Math.pow(Math.min(1, value / maximum), 0.42);
+  const stops = [
+    [0, [255, 0, 255, 220]], [0.18, [185, 0, 255, 230]],
+    [0.38, [255, 0, 100, 240]], [0.62, [255, 80, 0, 248]],
+    [0.82, [255, 215, 0, 255]], [1, [255, 255, 255, 255]]
+  ];
+  for (let k = 1; k < stops.length; k++) {
+    if (norm <= stops[k][0]) {
+      const fraction = (norm - stops[k - 1][0]) / (stops[k][0] - stops[k - 1][0]);
+      return stops[k - 1][1].map((v, channel) =>
+        Math.round(v + fraction * (stops[k][1][channel] - v)));
+    }
+  }
+  return stops[stops.length - 1][1];
+}
 
-  // Limpiar capas previas
+function mercatorPixelToLatitude(pixelY, worldSize) {
+  return Math.atan(Math.sinh(Math.PI * (1 - 2 * pixelY / worldSize))) * 180 / Math.PI;
+}
+
+function makeTileAxisSamples(axis, count, origin, ratio, worldSize, isLatitude) {
+  const center = new Int32Array(count), first = new Int32Array(count), last = new Int32Array(count);
+  const coordinate = pixel => isLatitude
+    ? mercatorPixelToLatitude(pixel, worldSize) : pixel / worldSize * 360 - 180;
+  for (let p = 0; p < count; p++) {
+    center[p] = nearestAxisIndex(axis, coordinate(origin + (p + 0.5) / ratio));
+    // Bordes ligeramente interiores para no incluir la celda contigua cuando
+    // la arista coincide exactamente con el borde de un píxel.
+    const a = nearestAxisIndex(axis, coordinate(origin + (p + 1e-6) / ratio));
+    const b = nearestAxisIndex(axis, coordinate(origin + (p + 1 - 1e-6) / ratio));
+    first[p] = a < 0 || b < 0 ? -1 : Math.min(a, b);
+    last[p] = a < 0 || b < 0 ? -1 : Math.max(a, b);
+  }
+  return { center, first, last };
+}
+
+function fogPixelValue(summary, xSamples, ySamples, px, py) {
+  const i = xSamples.center[px], j = ySamples.center[py];
+  const x0 = xSamples.first[px], x1 = xSamples.last[px];
+  const y0 = ySamples.first[py], y1 = ySamples.last[py];
+  if (i < 0 || j < 0 || x0 < 0 || y0 < 0) return null;
+  const { values, geometry } = summary;
+  const value = values[j * geometry.width + i];
+  if (!Number.isFinite(value) || value <= 0) return null;
+  // Máscara conservadora: si un píxel de pantalla abarca alguna celda cero
+  // o sin dato, no se colorea. Así un foco pequeño no invade celdas vacías.
+  // Los focos menores que un píxel se recuperan al acercar el mapa.
+  for (let row = y0; row <= y1; row++) {
+    for (let col = x0; col <= x1; col++) {
+      if (!(values[row * geometry.width + col] > 0)) return null;
+    }
+  }
+  return value;
+}
+
+function paintFogTile(summary, coordinates, tileSize = 256, pixelRatio = 1) {
+  const ratio = pixelRatio > 1 ? 2 : 1;
+  const width = Math.round(tileSize * ratio), height = width;
+  const worldSize = tileSize * Math.pow(2, coordinates.z);
+  const xSamples = makeTileAxisSamples(summary.geometry.x, width,
+    coordinates.x * tileSize, ratio, worldSize, false);
+  const ySamples = makeTileAxisSamples(summary.geometry.y, height,
+    coordinates.y * tileSize, ratio, worldSize, true);
+  const data = new Uint8ClampedArray(width * height * 4);
+  if (!summary.colorTable) {
+    summary.colorTable = Array.from({ length: 4096 }, (_, k) => fogColor(k || 1, 4095));
+  }
+  for (let py = 0; py < height; py++) {
+    if (ySamples.center[py] < 0) continue;
+    for (let px = 0; px < width; px++) {
+      const value = fogPixelValue(summary, xSamples, ySamples, px, py);
+      if (value === null) continue; // alfa 0: se conserva exclusivamente el satélite
+      const colorIndex = Math.max(1, Math.min(4095, Math.round(value / summary.displayMax * 4095)));
+      const color = summary.colorTable[colorIndex], offset = (py * width + px) * 4;
+      data[offset] = color[0]; data[offset + 1] = color[1];
+      data[offset + 2] = color[2]; data[offset + 3] = color[3];
+    }
+  }
+  return { width, height, data };
+}
+
+function removeFogOverlay() {
   if (ncOverlayLayer) { map.removeLayer(ncOverlayLayer); ncOverlayLayer = null; }
   if (ncLegendControl) { map.removeControl(ncLegendControl); ncLegendControl = null; }
+}
 
-  const xArr = state.ncData.x;
-  const yArr = state.ncData.y;
-  if (!xArr || !yArr || xArr.length === 0 || yArr.length === 0) return;
-
-  // Si es fallback indexado (sin datos reales), solo centrar el mapa
-  if (state.ncData.isIndexedFallback) {
-    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-    for (const v of yArr) { if (v < minLat) minLat = v; if (v > maxLat) maxLat = v; }
-    for (const v of xArr) { if (v < minLon) minLon = v; if (v > maxLon) maxLon = v; }
-    map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
-    return;
-  }
-
-  const numX = xArr.length;
-  const numY = yArr.length;
-
-  // La misma variable gobierna el ráster, la leyenda y el valor mostrado en
-  // la celda seleccionada, evitando mensajes visuales contradictorios.
-  const varToPlot = getMapVariableName();
-  if (!varToPlot) return;
-
-  const vObj = state.ncData.variables[varToPlot];
-  const data = vObj ? vObj.data : null;
-  if (!data) return;
-
-  statusText.textContent = "Generando mapa ráster...";
-
-  // Calcular suma temporal → mapa 2D [j * numX + i]
-  const grid2d = new Float32Array(numY * numX);
-
-  if (vObj.dimensions && vObj.dimensions.length === 3) {
-    // Inferir número real de pasos de tiempo a partir del tamaño del array
-    const actualT = Math.round(data.length / (numY * numX));
-    for (let t = 0; t < actualT; t++) {
-      const base = t * numY * numX;
-      for (let j = 0; j < numY; j++) {
-        const rowBase = base + j * numX;
-        for (let i = 0; i < numX; i++) {
-          const raw = data[rowBase + i];
-          if (raw > 0 && raw <= 1e30 && !isNaN(raw)) {
-            grid2d[j * numX + i] += raw;
-          }
-        }
+function drawNetCDFOverlay() {
+  if (!state.ncData || state.isLoading) return;
+  removeFogOverlay();
+  try {
+    const variable = getMapVariableName();
+    if (!variable) return;
+    const nc = state.ncData, summary = getLayerSummary(nc, variable);
+    const FogTiles = L.GridLayer.extend({
+      createTile(coordinates) {
+        const tile = L.DomUtil.create("canvas", "amaru-fog-raster");
+        const image = paintFogTile(summary, coordinates, 256, window.devicePixelRatio || 1);
+        tile.width = image.width; tile.height = image.height;
+        const ctx = tile.getContext("2d");
+        ctx.imageSmoothingEnabled = false;
+        const pixels = ctx.createImageData(image.width, image.height);
+        pixels.data.set(image.data); ctx.putImageData(pixels, 0, 0);
+        tile.setAttribute("aria-hidden", "true");
+        return tile;
       }
+    });
+    if (summary.displayMax > 0) {
+      ncOverlayLayer = new FogTiles({
+        tileSize: 256, opacity: 0.96, noWrap: true,
+        bounds: summary.geometry.bounds, zIndex: 200,
+        updateWhenIdle: true, updateWhenZooming: false, keepBuffer: 1
+      }).addTo(map);
     }
-  } else if (vObj.dimensions && vObj.dimensions.length === 2) {
-    for (let k = 0; k < grid2d.length && k < data.length; k++) {
-      const raw = data[k];
-      if (raw > 0 && raw <= 1e30 && !isNaN(raw)) grid2d[k] = raw;
+    // Conservar el zoom y el encuadre al cambiar de variable.
+    if (lastFittedDataset !== nc) {
+      lastFittedDataset = nc;
+      map.fitBounds(summary.geometry.bounds, { padding: [32, 32], maxZoom: 12 });
     }
+    const period = summary.useSum ? "Suma del período · Wh" : "Promedio del período · " + variable;
+    const range = summary.displayMax ? "> 0 — " + formatFogValue(summary.displayMax) : "Sin valores positivos";
+    const gradient = Array.from({ length: 9 }, (_, k) => {
+      const color = fogColor(Math.max(1e-12, k / 8), 1);
+      return "rgb(" + color.slice(0, 3).join(",") + ") " + (k * 12.5) + "%";
+    }).join(",");
+    ncLegendControl = L.control({ position: "bottomright" });
+    ncLegendControl.onAdd = () => {
+      const div = L.DomUtil.create("div", "nc-raster-legend");
+      div.style.cssText = "background:rgba(15,23,42,.94);color:#e2e8f0;padding:10px 12px;" +
+        "border:1px solid #475569;border-radius:10px;font:12px Inter,sans-serif;max-width:250px";
+      const title = document.createElement("strong"); title.textContent = period; div.appendChild(title);
+      const bar = document.createElement("div");
+      bar.style.cssText = "height:12px;margin:8px 0 4px;border-radius:3px;background:linear-gradient(to right," + gradient + ")";
+      div.appendChild(bar);
+      const labels = document.createElement("div");
+      labels.textContent = range + (summary.units ? " " + summary.units : "");
+      div.appendChild(labels);
+      const note = document.createElement("div");
+      note.style.cssText = "font-size:10px;line-height:1.5;margin-top:6px;color:#cbd5e1";
+      note.textContent = "Sin color: cero o sin dato. P98: los valores superiores saturan la escala.";
+      div.appendChild(note);
+      const zoomNote = document.createElement("div");
+      zoomNote.style.cssText = "font-size:10px;margin-top:3px;color:#94a3b8";
+      zoomNote.textContent = "Acércate para ver celdas pequeñas · Malla exacta v4";
+      div.appendChild(zoomNote);
+      L.DomEvent.disableClickPropagation(div); L.DomEvent.disableScrollPropagation(div);
+      return div;
+    };
+    ncLegendControl.addTo(map);
+    if (state.extractedTimeSeries) drawSelectedGridCell();
+    statusText.textContent = "Mapa de celdas exactas · " + variable + " · " + APP_VERSION;
+  } catch (error) {
+    console.error(error);
+    statusText.textContent = "No se puede dibujar la malla: " + error.message;
   }
-
-  // Calcular valor máximo real y percentil 98 para la escala visual.
-  // El P98 evita que una sola celda extrema vuelva invisible el resto de la niebla.
-  let maxVal = 0;
-  const positiveDisplayValues = [];
-  for (let k = 0; k < grid2d.length; k++) {
-    if (grid2d[k] > maxVal) maxVal = grid2d[k];
-    if (grid2d[k] > 0 && Number.isFinite(grid2d[k])) positiveDisplayValues.push(grid2d[k]);
-  }
-
-  if (maxVal === 0) {
-    statusText.textContent = `Cargado ${state.activeFilename} (sin datos no-cero en el área)`;
-    return;
-  }
-
-  positiveDisplayValues.sort((a, b) => a - b);
-  const p98Index = Math.max(0, Math.floor((positiveDisplayValues.length - 1) * 0.98));
-  const displayMax = positiveDisplayValues[p98Index] || maxVal;
-
-  // Rampa cálida de alto contraste. Se evita deliberadamente el azul porque
-  // se confunde con el mar, sombras y vegetación del fondo satelital.
-  // Los valores nulos y cero permanecen completamente transparentes.
-  function fogColormap(norm) {
-    if (norm <= 0) return [0, 0, 0, 0]; // transparente
-    const stops = [
-      [0.001, [255, 0,   255, 190]],
-      [0.18,  [185, 0,   255, 215]],
-      [0.38,  [255, 0,   100, 235]],
-      [0.62,  [255, 80,  0,   245]],
-      [0.82,  [255, 215, 0,   252]],
-      [1.00,  [255, 255, 255, 255]]
-    ];
-    for (let s = 1; s < stops.length; s++) {
-      if (norm <= stops[s][0]) {
-        const t = (norm - stops[s - 1][0]) / (stops[s][0] - stops[s - 1][0]);
-        return stops[s - 1][1].map((v, i) => Math.round(v + t * (stops[s][1][i] - v)));
-      }
-    }
-    return stops[stops.length - 1][1];
-  }
-
-  // Dibujar canvas
-  const canvas = document.createElement("canvas");
-  canvas.width = numX;
-  canvas.height = numY;
-  const ctx = canvas.getContext("2d");
-  const imgData = ctx.createImageData(numX, numY);
-
-  // Detectar orientación de latitud (si asciende o desciende con el índice)
-  const latAscending = yArr.length > 1 && yArr[1] > yArr[0];
-
-  for (let j = 0; j < numY; j++) {
-    // El canvas row 0 debe ser el Norte (latitud máxima).
-    // Si lat desciende (más común en NetCDF geoespacial): row 0 = North → dataJ = j
-    // Si lat asciende: row 0 = South → hay que invertir
-    const dataJ = latAscending ? (numY - 1 - j) : j;
-    const rowBase = dataJ * numX;
-    const canvasBase = j * numX;
-    for (let i = 0; i < numX; i++) {
-      const rawNorm = Math.min(1, grid2d[rowBase + i] / displayMax);
-      // Corrección gamma: expande los valores bajos y medios para hacerlos visibles.
-      const norm = rawNorm > 0 ? Math.pow(rawNorm, 0.42) : 0;
-      const [r, g, b, a] = fogColormap(norm);
-      const px = (canvasBase + i) * 4;
-      imgData.data[px]     = r;
-      imgData.data[px + 1] = g;
-      imgData.data[px + 2] = b;
-      imgData.data[px + 3] = a;
-    }
-  }
-  ctx.putImageData(imgData, 0, 0);
-
-  // Las coordenadas NetCDF representan centros de celdas. Leaflet necesita
-  // los bordes externos del ráster; usar los centros como límites desplazaba
-  // visualmente la capa aproximadamente media celda.
-  const lonExtent = getGridExtentEdges(xArr);
-  const latExtent = getGridExtentEdges(yArr);
-  if (!lonExtent || !latExtent) return;
-  const [minLon, maxLon] = lonExtent;
-  const [minLat, maxLat] = latExtent;
-
-  // Agregar overlay al mapa
-  const imageUrl = canvas.toDataURL("image/png");
-  ncOverlayLayer = L.imageOverlay(imageUrl, [[minLat, minLon], [maxLat, maxLon]], {
-    opacity: 0.96,
-    interactive: false,
-    zIndex: 200,
-    className: "amaru-fog-raster"
-  }).addTo(map);
-
-  // Reponer el contorno por encima del nuevo ráster cuando cambia la variable.
-  if (state.extractedTimeSeries) drawSelectedGridCell();
-
-  // Ajustar vista del mapa a los límites del dataset
-  map.fitBounds([[minLat, minLon], [maxLat, maxLon]], { padding: [40, 40] });
-
-  // Agregar leyenda de color
-  const units = (vObj.units || vObj.attributes?.units || "").trim();
-  ncLegendControl = L.control({ position: "bottomright" });
-  ncLegendControl.onAdd = function () {
-    const div = L.DomUtil.create("div", "nc-raster-legend");
-    div.innerHTML = `
-      <div style="
-        background: rgba(15,23,42,0.88);
-        padding: 10px 14px;
-        border-radius: 10px;
-        border: 1px solid rgba(255,45,149,0.55);
-        font-family: Inter, sans-serif;
-        color: #94a3b8;
-        font-size: 12px;
-        min-width: 150px;
-        backdrop-filter: blur(6px);
-      ">
-        <div style="font-weight:600;color:#f8fafc;margin-bottom:6px;">
-          ${varToPlot}${units ? " ("+units+")" : ""}
-        </div>
-        <div style="
-          width:100%;
-          height:12px;
-          border-radius:4px;
-          background: linear-gradient(to right,
-            rgba(255,0,255,0.75),
-            rgb(185,0,255),
-            rgb(255,0,100),
-            rgb(255,80,0),
-            rgb(255,215,0),
-            rgb(255,255,255)
-          );
-          margin-bottom:4px;
-        "></div>
-        <div style="display:flex;justify-content:space-between;font-size:10px;">
-          <span>0</span>
-          <span>${displayMax.toFixed(2)}</span>
-        </div>
-        <div style="margin-top:5px;font-size:10px;color:#94a3b8;">Fucsia: bajo · amarillo/blanco: alto</div>
-        <div style="margin-top:2px;font-size:10px;color:#64748b;">Σ anual · escala visual P98</div>
-      </div>
-    `;
-    return div;
-  };
-  ncLegendControl.addTo(map);
-
-  statusText.textContent = `Mapa ráster: ${varToPlot} — ${state.activeFilename}`;
 }
 
 function exportToExcel() {
@@ -1366,7 +1397,7 @@ function exportToExcel() {
 
   const suma = valoresValidos.reduce((acumulado, valor) => acumulado + valor, 0);
   const promedio = valoresValidos.length > 0 ? suma / valoresValidos.length : null;
-  const resumenAnual = esWh ? suma : promedio;
+  const resumenAnual = valoresValidos.length ? (esWh ? suma : promedio) : null;
   const maximoMensual = valoresValidos.length > 0 ? Math.max(...valoresValidos) : null;
   const indiceMaximo = maximoMensual === null
     ? -1
@@ -1535,86 +1566,16 @@ function obtenerAnioRepresentativo(pasosTiempo, nombreArchivo) {
 }
 
 function coordenadaDentroDeExtension(longitud, latitud) {
-  const x = state.ncData && state.ncData.x;
-  const y = state.ncData && state.ncData.y;
-  if (!x || !y || x.length === 0 || y.length === 0) return false;
-
-  let minX = x[0];
-  let maxX = x[0];
-  let minY = y[0];
-  let maxY = y[0];
-
-  for (let i = 1; i < x.length; i++) {
-    if (x[i] < minX) minX = x[i];
-    if (x[i] > maxX) maxX = x[i];
-  }
-  for (let j = 1; j < y.length; j++) {
-    if (y[j] < minY) minY = y[j];
-    if (y[j] > maxY) maxY = y[j];
-  }
-
-  return longitud >= minX && longitud <= maxX && latitud >= minY && latitud <= maxY;
+  try {
+    const geometry = getGridGeometry();
+    return nearestAxisIndex(geometry.x, longitud) >= 0 && nearestAxisIndex(geometry.y, latitud) >= 0;
+  } catch (_) { return false; }
 }
 
 function calcularEstadisticasCapa(nombreVariable, usarSuma) {
-  const resultadoVacio = {
-    nValidos: 0,
-    nPositivos: 0,
-    porcentajePositivo: 0,
-    minimoPositivo: null,
-    p25: null,
-    mediana: null,
-    p75: null,
-    p90: null,
-    maximo: null
-  };
-
-  const variable = state.ncData && state.ncData.variables[nombreVariable];
-  const data = variable && variable.data;
-  const x = state.ncData && state.ncData.x;
-  const y = state.ncData && state.ncData.y;
-  if (!data || !x || !y || x.length === 0 || y.length === 0) return resultadoVacio;
-
-  const numeroCeldas = x.length * y.length;
-  const esTresDimensiones = variable.dimensions && variable.dimensions.length === 3;
-  const numeroTiempos = esTresDimensiones
-    ? Math.max(1, Math.floor(data.length / numeroCeldas))
-    : 1;
-  const valoresCapa = [];
-
-  for (let celda = 0; celda < numeroCeldas; celda++) {
-    let acumulado = 0;
-    let validosCelda = 0;
-
-    for (let t = 0; t < numeroTiempos; t++) {
-      const indice = esTresDimensiones ? t * numeroCeldas + celda : celda;
-      const valor = data[indice];
-      if (typeof valor === "number" && Number.isFinite(valor) && valor <= 1e30) {
-        acumulado += valor;
-        validosCelda++;
-      }
-    }
-
-    if (validosCelda > 0) {
-      valoresCapa.push(usarSuma ? acumulado : acumulado / validosCelda);
-    }
-  }
-
-  if (valoresCapa.length === 0) return resultadoVacio;
-
-  valoresCapa.sort((a, b) => a - b);
-  const positivos = valoresCapa.filter(valor => valor > 0);
-  return {
-    nValidos: valoresCapa.length,
-    nPositivos: positivos.length,
-    porcentajePositivo: redondear((positivos.length / valoresCapa.length) * 100, 6),
-    minimoPositivo: positivos.length > 0 ? positivos[0] : null,
-    p25: percentil(valoresCapa, 0.25),
-    mediana: percentil(valoresCapa, 0.50),
-    p75: percentil(valoresCapa, 0.75),
-    p90: percentil(valoresCapa, 0.90),
-    maximo: valoresCapa[valoresCapa.length - 1]
-  };
+  // Las estadísticas se calculan sobre la misma capa que se pinta, sin repetir
+  // la lectura de los 12 meses ni ordenar millones de ceros al descargar.
+  return getLayerSummary(state.ncData, nombreVariable).statistics;
 }
 
 function percentil(valoresOrdenados, proporcion) {
